@@ -133,6 +133,9 @@ public:
 	/** Returns a MTLArgumentEncoder for the ICB buffer index of a DrawIndirectCount kernel. */
 	id<MTLArgumentEncoder> getCmdDrawIndirectCountICBMTLArgumentEncoder(bool indexed, MTLIndexType idxType);
 
+	/** Returns a cached ICB for DrawIndirectCount, growing if needed. [0]=draw, [1]=drawIndexed. */
+	id<MTLIndirectCommandBuffer> getDrawIndirectCountICB(bool indexed, uint32_t maxCommandCount);
+
 	/** Returns a MTLComputePipelineState for copying query results to a buffer. */
 	id<MTLComputePipelineState> getCmdCopyQueryPoolResultsMTLComputePipelineState();
 
@@ -184,5 +187,7 @@ protected:
 	id<MTLComputePipelineState> _mtlConvertUint8IndicesComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlDrawIndirectCountICBComputePipelineState[3] = {nil, nil, nil};
 	id<MTLArgumentEncoder> _mtlDrawIndirectCountICBArgumentEncoder[3] = {nil, nil, nil};
+	id<MTLIndirectCommandBuffer> _mtlDrawIndirectCountICB[2] = {nil, nil};
+	uint32_t _mtlDrawIndirectCountICBCapacity[2] = {0, 0};
 };
 

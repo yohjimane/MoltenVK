@@ -167,6 +167,35 @@ id<MTLArgumentEncoder> MVKCommandEncodingPool::getCmdDrawIndirectCountICBMTLArgu
 	MVK_ENC_REZ_ACCESS(_mtlDrawIndirectCountICBArgumentEncoder[idx], newCmdDrawIndirectCountICBMTLArgumentEncoder(indexed, idxType));
 }
 
+id<MTLIndirectCommandBuffer> MVKCommandEncodingPool::getDrawIndirectCountICB(bool indexed, uint32_t maxCommandCount) {
+	int idx = indexed ? 1 : 0;
+
+	lock_guard<mutex> lock(_lock);
+
+	if (_mtlDrawIndirectCountICB[idx] && _mtlDrawIndirectCountICBCapacity[idx] >= maxCommandCount) {
+		[_mtlDrawIndirectCountICB[idx] resetWithRange: NSMakeRange(0, maxCommandCount)];
+		return _mtlDrawIndirectCountICB[idx];
+	}
+
+	[_mtlDrawIndirectCountICB[idx] release];
+
+	MTLIndirectCommandBufferDescriptor* icbDesc = [MTLIndirectCommandBufferDescriptor new];
+	icbDesc.commandTypes = indexed ? MTLIndirectCommandTypeDrawIndexed : MTLIndirectCommandTypeDraw;
+	icbDesc.inheritPipelineState = YES;
+	icbDesc.inheritBuffers = YES;
+	icbDesc.maxVertexBufferBindCount = 0;
+	icbDesc.maxFragmentBufferBindCount = 0;
+
+	_mtlDrawIndirectCountICB[idx] =
+		[_commandPool->getDevice()->getPhysicalDevice()->getMTLDevice() newIndirectCommandBufferWithDescriptor: icbDesc
+																								maxCommandCount: maxCommandCount
+																										options: MTLResourceStorageModePrivate];
+	_mtlDrawIndirectCountICBCapacity[idx] = maxCommandCount;
+	[icbDesc release];
+
+	return _mtlDrawIndirectCountICB[idx];
+}
+
 id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdCopyQueryPoolResultsMTLComputePipelineState() {
 	MVK_ENC_REZ_ACCESS(_mtlCopyQueryPoolResultsComputePipelineState, newCmdCopyQueryPoolResultsMTLComputePipelineState(_commandPool));
 }
@@ -277,6 +306,12 @@ void MVKCommandEncodingPool::destroyMetalResources() {
 		_mtlDrawIndirectCountICBComputePipelineState[i] = nil;
 		[_mtlDrawIndirectCountICBArgumentEncoder[i] release];
 		_mtlDrawIndirectCountICBArgumentEncoder[i] = nil;
+	}
+
+	for (uint32_t i = 0; i < 2; i++) {
+		[_mtlDrawIndirectCountICB[i] release];
+		_mtlDrawIndirectCountICB[i] = nil;
+		_mtlDrawIndirectCountICBCapacity[i] = 0;
 	}
 }
 
