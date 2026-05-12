@@ -364,6 +364,14 @@ public:
 	id<MTLComputePipelineState> newCmdDrawIndexedCopyIndexBufferMTLComputePipelineState(MTLIndexType type,
 																						MVKVulkanAPIDeviceObject* owner);
 
+	/** Returns a new MTLComputePipelineState for populating an ICB for DrawIndirectCount. */
+	id<MTLComputePipelineState> newCmdDrawIndirectCountICBMTLComputePipelineState(bool indexed,
+																				  MTLIndexType idxType,
+																				  MVKVulkanAPIDeviceObject* owner);
+
+	/** Returns a new MTLArgumentEncoder for the ICB buffer index of a DrawIndirectCount kernel. */
+	id<MTLArgumentEncoder> newCmdDrawIndirectCountICBMTLArgumentEncoder(bool indexed, MTLIndexType idxType);
+
 	/** Returns a new MTLComputePipelineState for copying query results to a buffer. */
 	id<MTLComputePipelineState> newCmdCopyQueryPoolResultsMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 

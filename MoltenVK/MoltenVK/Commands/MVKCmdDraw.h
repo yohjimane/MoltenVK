@@ -193,3 +193,59 @@ protected:
 	uint32_t _drawCount;
 	uint32_t _directCmdFirstInstance;
 };
+
+
+#pragma mark -
+#pragma mark MVKCmdDrawIndirectCount
+
+class MVKCmdDrawIndirectCount : public MVKCommand {
+
+public:
+	VkResult setContent(MVKCommandBuffer* cmdBuff,
+						VkBuffer buffer,
+						VkDeviceSize offset,
+						VkBuffer countBuffer,
+						VkDeviceSize countBufferOffset,
+						uint32_t maxDrawCount,
+						uint32_t stride);
+
+	void encode(MVKCommandEncoder* cmdEncoder) override;
+
+protected:
+	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+
+	id<MTLBuffer> _mtlIndirectBuffer;
+	VkDeviceSize _mtlIndirectBufferOffset;
+	id<MTLBuffer> _mtlCountBuffer;
+	VkDeviceSize _mtlCountBufferOffset;
+	uint32_t _maxDrawCount;
+	uint32_t _mtlIndirectBufferStride;
+};
+
+
+#pragma mark -
+#pragma mark MVKCmdDrawIndexedIndirectCount
+
+class MVKCmdDrawIndexedIndirectCount : public MVKCommand {
+
+public:
+	VkResult setContent(MVKCommandBuffer* cmdBuff,
+						VkBuffer buffer,
+						VkDeviceSize offset,
+						VkBuffer countBuffer,
+						VkDeviceSize countBufferOffset,
+						uint32_t maxDrawCount,
+						uint32_t stride);
+
+	void encode(MVKCommandEncoder* cmdEncoder) override;
+
+protected:
+	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+
+	id<MTLBuffer> _mtlIndirectBuffer;
+	VkDeviceSize _mtlIndirectBufferOffset;
+	id<MTLBuffer> _mtlCountBuffer;
+	VkDeviceSize _mtlCountBufferOffset;
+	uint32_t _maxDrawCount;
+	uint32_t _mtlIndirectBufferStride;
+};

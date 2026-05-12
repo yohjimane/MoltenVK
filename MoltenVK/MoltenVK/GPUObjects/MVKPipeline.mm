@@ -1201,6 +1201,8 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 	// The best we can do at this point is set the pipeline name from the layout.
 	setMetalObjectLabel(plDesc, ((MVKPipelineLayout*)pCreateInfo->layout)->getDebugName());
 
+	plDesc.supportIndirectCommandBuffers = YES;
+
 	return plDesc;
 }
 

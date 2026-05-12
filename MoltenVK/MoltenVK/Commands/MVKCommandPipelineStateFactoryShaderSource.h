@@ -25,6 +25,7 @@
 
 static NSString* _MVKStaticCmdShaderSource = @R"(
 #include <metal_stdlib>
+#include <metal_command_buffer>
 using namespace metal;
 
 typedef struct {
@@ -500,5 +501,97 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
                                    uint pos [[thread_position_in_grid]]) {
 	uint8_t idx = src[pos];
 	dst[pos] = idx;
+}
+
+struct ICBContainer {
+	command_buffer icb [[id(0)]];
+};
+
+typedef struct {
+	uint32_t location;
+	uint32_t length;
+} ICBExecutionRange;
+
+kernel void cmdDrawIndirectCountICB(
+	device ICBContainer *icbContainer        [[buffer(0)]],
+	const device uint8_t *srcBuff            [[buffer(1)]],
+	const device uint32_t *countBuf          [[buffer(2)]],
+	device ICBExecutionRange *execRange      [[buffer(3)]],
+	constant uint32_t &maxDrawCount          [[buffer(4)]],
+	constant uint32_t &stride                [[buffer(5)]],
+	constant uint32_t &primType              [[buffer(6)]],
+	uint tid [[thread_position_in_grid]])
+{
+	if (tid == 0) {
+		uint32_t actualCount = min(*countBuf, maxDrawCount);
+		execRange->location = 0;
+		execRange->length = actualCount;
+	}
+	if (tid < maxDrawCount) {
+		render_command cmd(icbContainer->icb, tid);
+		const device auto *args =
+			(const device MTLDrawPrimitivesIndirectArguments *)(srcBuff + tid * stride);
+		cmd.draw_primitives(primitive_type(primType),
+						   args->vertexStart, args->vertexCount,
+						   args->instanceCount, args->baseInstance);
+	}
+}
+
+kernel void cmdDrawIndexedIndirectCountICB16(
+	device ICBContainer *icbContainer        [[buffer(0)]],
+	const device uint8_t *srcBuff            [[buffer(1)]],
+	const device uint32_t *countBuf          [[buffer(2)]],
+	device ICBExecutionRange *execRange      [[buffer(3)]],
+	constant uint32_t &maxDrawCount          [[buffer(4)]],
+	constant uint32_t &stride                [[buffer(5)]],
+	constant uint32_t &primType              [[buffer(6)]],
+	const device ushort *indexBuffer         [[buffer(7)]],
+	uint tid [[thread_position_in_grid]])
+{
+	if (tid == 0) {
+		uint32_t actualCount = min(*countBuf, maxDrawCount);
+		execRange->location = 0;
+		execRange->length = actualCount;
+	}
+	if (tid < maxDrawCount) {
+		render_command cmd(icbContainer->icb, tid);
+		const device auto *args =
+			(const device MTLDrawIndexedPrimitivesIndirectArguments *)(srcBuff + tid * stride);
+		cmd.draw_indexed_primitives(primitive_type(primType),
+								   args->indexCount,
+								   indexBuffer + args->indexStart,
+								   args->instanceCount,
+								   args->baseVertex,
+								   args->baseInstance);
+	}
+}
+
+kernel void cmdDrawIndexedIndirectCountICB32(
+	device ICBContainer *icbContainer        [[buffer(0)]],
+	const device uint8_t *srcBuff            [[buffer(1)]],
+	const device uint32_t *countBuf          [[buffer(2)]],
+	device ICBExecutionRange *execRange      [[buffer(3)]],
+	constant uint32_t &maxDrawCount          [[buffer(4)]],
+	constant uint32_t &stride                [[buffer(5)]],
+	constant uint32_t &primType              [[buffer(6)]],
+	const device uint *indexBuffer           [[buffer(7)]],
+	uint tid [[thread_position_in_grid]])
+{
+	if (tid == 0) {
+		uint32_t actualCount = min(*countBuf, maxDrawCount);
+		execRange->location = 0;
+		execRange->length = actualCount;
+	}
+	if (tid < maxDrawCount) {
+		render_command cmd(icbContainer->icb, tid);
+		const device auto *args =
+			(const device MTLDrawIndexedPrimitivesIndirectArguments *)(srcBuff + tid * stride);
+		cmd.draw_indexed_primitives(primitive_type(primType),
+								   args->indexCount,
+								   indexBuffer + args->indexStart,
+								   args->instanceCount,
+								   args->baseVertex,
+								   args->baseInstance);
+	}
 }
 )";

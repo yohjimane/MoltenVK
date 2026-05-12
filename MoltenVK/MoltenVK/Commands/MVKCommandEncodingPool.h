@@ -127,6 +127,12 @@ public:
 	/** Returns a MTLComputePipelineState for copying an index buffer for use in an indirect tessellated draw. */
 	id<MTLComputePipelineState> getCmdDrawIndexedCopyIndexBufferMTLComputePipelineState(MTLIndexType type);
 
+	/** Returns a MTLComputePipelineState for populating an ICB for DrawIndirectCount. */
+	id<MTLComputePipelineState> getCmdDrawIndirectCountICBMTLComputePipelineState(bool indexed, MTLIndexType idxType);
+
+	/** Returns a MTLArgumentEncoder for the ICB buffer index of a DrawIndirectCount kernel. */
+	id<MTLArgumentEncoder> getCmdDrawIndirectCountICBMTLArgumentEncoder(bool indexed, MTLIndexType idxType);
+
 	/** Returns a MTLComputePipelineState for copying query results to a buffer. */
 	id<MTLComputePipelineState> getCmdCopyQueryPoolResultsMTLComputePipelineState();
 
@@ -176,5 +182,7 @@ protected:
 	id<MTLComputePipelineState> _mtlCopyQueryPoolResultsComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlAccumOcclusionQueryResultsComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlConvertUint8IndicesComputePipelineState = nil;
+	id<MTLComputePipelineState> _mtlDrawIndirectCountICBComputePipelineState[3] = {nil, nil, nil};
+	id<MTLArgumentEncoder> _mtlDrawIndirectCountICBArgumentEncoder[3] = {nil, nil, nil};
 };
 

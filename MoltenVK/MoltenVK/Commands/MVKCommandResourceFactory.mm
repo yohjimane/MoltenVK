@@ -577,6 +577,35 @@ id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndexedCopyInde
 									  : "cmdDrawIndexedCopyIndex32Buffer", owner);
 }
 
+static const char* _getCmdDrawIndirectCountICBFuncName(bool indexed, MTLIndexType idxType) {
+	if (!indexed) return "cmdDrawIndirectCountICB";
+	return idxType == MTLIndexTypeUInt16 ? "cmdDrawIndexedIndirectCountICB16" : "cmdDrawIndexedIndirectCountICB32";
+}
+
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectCountICBMTLComputePipelineState(bool indexed,
+																										  MTLIndexType idxType,
+																										  MVKVulkanAPIDeviceObject* owner) {
+	const char* funcName = _getCmdDrawIndirectCountICBFuncName(indexed, idxType);
+	id<MTLFunction> mtlFunc = newFunctionNamed(funcName);
+	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];
+	plDesc.computeFunction = mtlFunc;
+	plDesc.supportIndirectCommandBuffers = YES;
+	MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(owner);
+	id<MTLComputePipelineState> cps = plc->newMTLComputePipelineState(plDesc);
+	plc->destroy();
+	[plDesc release];
+	[mtlFunc release];
+	return cps;
+}
+
+id<MTLArgumentEncoder> MVKCommandResourceFactory::newCmdDrawIndirectCountICBMTLArgumentEncoder(bool indexed, MTLIndexType idxType) {
+	const char* funcName = _getCmdDrawIndirectCountICBFuncName(indexed, idxType);
+	id<MTLFunction> mtlFunc = newFunctionNamed(funcName);
+	id<MTLArgumentEncoder> argEnc = [mtlFunc newArgumentEncoderWithBufferIndex:0];
+	[mtlFunc release];
+	return argEnc;
+}
+
 id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdCopyQueryPoolResultsMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
 	return newMTLComputePipelineState("cmdCopyQueryPoolResultsToBuffer", owner);
 }

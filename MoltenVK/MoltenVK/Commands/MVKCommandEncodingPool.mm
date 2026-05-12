@@ -153,6 +153,20 @@ id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdDrawIndexedCopyIndexBu
 	MVK_ENC_REZ_ACCESS(_mtlDrawIndexedCopyIndexBufferComputePipelineState[type == MTLIndexTypeUInt16 ? 1 : 0], newCmdDrawIndexedCopyIndexBufferMTLComputePipelineState(type, _commandPool));
 }
 
+static int _getDrawIndirectCountICBIndex(bool indexed, MTLIndexType idxType) {
+	return indexed ? (idxType == MTLIndexTypeUInt16 ? 1 : 2) : 0;
+}
+
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdDrawIndirectCountICBMTLComputePipelineState(bool indexed, MTLIndexType idxType) {
+	int idx = _getDrawIndirectCountICBIndex(indexed, idxType);
+	MVK_ENC_REZ_ACCESS(_mtlDrawIndirectCountICBComputePipelineState[idx], newCmdDrawIndirectCountICBMTLComputePipelineState(indexed, idxType, _commandPool));
+}
+
+id<MTLArgumentEncoder> MVKCommandEncodingPool::getCmdDrawIndirectCountICBMTLArgumentEncoder(bool indexed, MTLIndexType idxType) {
+	int idx = _getDrawIndirectCountICBIndex(indexed, idxType);
+	MVK_ENC_REZ_ACCESS(_mtlDrawIndirectCountICBArgumentEncoder[idx], newCmdDrawIndirectCountICBMTLArgumentEncoder(indexed, idxType));
+}
+
 id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdCopyQueryPoolResultsMTLComputePipelineState() {
 	MVK_ENC_REZ_ACCESS(_mtlCopyQueryPoolResultsComputePipelineState, newCmdCopyQueryPoolResultsMTLComputePipelineState(_commandPool));
 }
@@ -257,5 +271,12 @@ void MVKCommandEncodingPool::destroyMetalResources() {
 
     [_mtlConvertUint8IndicesComputePipelineState release];
     _mtlConvertUint8IndicesComputePipelineState = nil;
+
+	for (uint32_t i = 0; i < 3; i++) {
+		[_mtlDrawIndirectCountICBComputePipelineState[i] release];
+		_mtlDrawIndirectCountICBComputePipelineState[i] = nil;
+		[_mtlDrawIndirectCountICBArgumentEncoder[i] release];
+		_mtlDrawIndirectCountICBArgumentEncoder[i] = nil;
+	}
 }
 

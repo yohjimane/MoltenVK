@@ -19,6 +19,8 @@
 #include "MVKCmdDraw.h"
 #include "MVKCommandBuffer.h"
 #include "MVKCommandPool.h"
+#include "MVKCommandEncodingPool.h"
+#include "MVKCommandResourceFactory.h"
 #include "MVKBuffer.h"
 #include "MVKPipeline.h"
 #include "MVKFoundation.h"
@@ -1236,5 +1238,224 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
             }
         }
     }
+}
+
+
+#pragma mark -
+#pragma mark MVKCmdDrawIndirectCount
+
+VkResult MVKCmdDrawIndirectCount::setContent(MVKCommandBuffer* cmdBuff,
+											 VkBuffer buffer,
+											 VkDeviceSize offset,
+											 VkBuffer countBuffer,
+											 VkDeviceSize countBufferOffset,
+											 uint32_t maxDrawCount,
+											 uint32_t stride) {
+	MVKBuffer* mvkBuffer = (MVKBuffer*)buffer;
+	_mtlIndirectBuffer = mvkBuffer->getMTLBuffer();
+	_mtlIndirectBufferOffset = mvkBuffer->getMTLBufferOffset() + offset;
+	_mtlIndirectBufferStride = stride;
+	_maxDrawCount = maxDrawCount;
+
+	MVKBuffer* mvkCountBuffer = (MVKBuffer*)countBuffer;
+	_mtlCountBuffer = mvkCountBuffer->getMTLBuffer();
+	_mtlCountBufferOffset = mvkCountBuffer->getMTLBufferOffset() + countBufferOffset;
+
+	auto& mtlFeats = cmdBuff->getMetalFeatures();
+	if (!mtlFeats.indirectDrawing) {
+		return cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdDrawIndirectCount(): The current device does not support indirect drawing.");
+	}
+
+	return VK_SUCCESS;
+}
+
+void MVKCmdDrawIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
+	if (_maxDrawCount == 0) { return; }
+
+	cmdEncoder->restartMetalRenderPassIfNeeded();
+	auto* pipeline = cmdEncoder->getGraphicsPipeline();
+
+	if (pipeline->isTessellationPipeline() ||
+		pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+		return;
+	}
+
+	cmdEncoder->_isIndexedDraw = false;
+	id<MTLDevice> mtlDevice = cmdEncoder->getMTLDevice();
+
+	MTLIndirectCommandBufferDescriptor* icbDesc = [MTLIndirectCommandBufferDescriptor new];
+	icbDesc.commandTypes = MTLIndirectCommandTypeDraw;
+	icbDesc.inheritPipelineState = YES;
+	icbDesc.inheritBuffers = YES;
+	icbDesc.maxVertexBufferBindCount = 0;
+	icbDesc.maxFragmentBufferBindCount = 0;
+
+	id<MTLIndirectCommandBuffer> icb =
+		[mtlDevice newIndirectCommandBufferWithDescriptor: icbDesc
+										  maxCommandCount: _maxDrawCount
+												  options: MTLResourceStorageModePrivate];
+	[icbDesc release];
+
+	[cmdEncoder->_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> cb) {
+		[icb release];
+	}];
+
+	auto* execRangeBuf = cmdEncoder->getTempMTLBuffer(sizeof(MTLIndirectCommandBufferExecutionRange), false);
+
+	auto* encPool = cmdEncoder->getCommandEncodingPool();
+	id<MTLComputePipelineState> mtlComputeState =
+		encPool->getCmdDrawIndirectCountICBMTLComputePipelineState(false, MTLIndexTypeUInt16);
+	id<MTLArgumentEncoder> argEnc =
+		encPool->getCmdDrawIndirectCountICBMTLArgumentEncoder(false, MTLIndexTypeUInt16);
+
+	auto* argBuf = cmdEncoder->getTempMTLBuffer(argEnc.encodedLength, false);
+	[argEnc setArgumentBuffer: argBuf->_mtlBuffer offset: argBuf->_offset];
+	[argEnc setIndirectCommandBuffer: icb atIndex: 0];
+
+	cmdEncoder->encodeStoreActions(true);
+	id<MTLComputeCommandEncoder> mtlComputeEnc =
+		cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDrawIndirectCountICB);
+
+	MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
+	state.bindPipeline(mtlComputeEnc, mtlComputeState);
+
+	uint32_t primType = (uint32_t)cmdEncoder->getMtlGraphics().getPrimitiveType();
+
+	state.bindBuffer(mtlComputeEnc, argBuf->_mtlBuffer,       argBuf->_offset,          0);
+	state.bindBuffer(mtlComputeEnc, _mtlIndirectBuffer,        _mtlIndirectBufferOffset, 1);
+	state.bindBuffer(mtlComputeEnc, _mtlCountBuffer,           _mtlCountBufferOffset,    2);
+	state.bindBuffer(mtlComputeEnc, execRangeBuf->_mtlBuffer, execRangeBuf->_offset,    3);
+	state.bindStructBytes(mtlComputeEnc, &_maxDrawCount,                                 4);
+	state.bindStructBytes(mtlComputeEnc, &_mtlIndirectBufferStride,                      5);
+	state.bindStructBytes(mtlComputeEnc, &primType,                                      6);
+
+	[mtlComputeEnc useResource: icb usage: MTLResourceUsageWrite];
+	[mtlComputeEnc useResource: _mtlIndirectBuffer usage: MTLResourceUsageRead];
+	[mtlComputeEnc useResource: _mtlCountBuffer usage: MTLResourceUsageRead];
+
+	[mtlComputeEnc dispatchThreads: MTLSizeMake(_maxDrawCount, 1, 1)
+			 threadsPerThreadgroup: MTLSizeMake(mtlComputeState.threadExecutionWidth, 1, 1)];
+
+	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+
+	cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);
+	if (!pipeline->hasValidMTLPipelineStates()) { return; }
+
+	[cmdEncoder->_mtlRenderEncoder useResource: icb usage: MTLResourceUsageRead];
+	[cmdEncoder->_mtlRenderEncoder executeCommandsInBuffer: icb
+											indirectBuffer: execRangeBuf->_mtlBuffer
+									  indirectBufferOffset: execRangeBuf->_offset];
+}
+
+
+#pragma mark -
+#pragma mark MVKCmdDrawIndexedIndirectCount
+
+VkResult MVKCmdDrawIndexedIndirectCount::setContent(MVKCommandBuffer* cmdBuff,
+													VkBuffer buffer,
+													VkDeviceSize offset,
+													VkBuffer countBuffer,
+													VkDeviceSize countBufferOffset,
+													uint32_t maxDrawCount,
+													uint32_t stride) {
+	MVKBuffer* mvkBuffer = (MVKBuffer*)buffer;
+	_mtlIndirectBuffer = mvkBuffer->getMTLBuffer();
+	_mtlIndirectBufferOffset = mvkBuffer->getMTLBufferOffset() + offset;
+	_mtlIndirectBufferStride = stride;
+	_maxDrawCount = maxDrawCount;
+
+	MVKBuffer* mvkCountBuffer = (MVKBuffer*)countBuffer;
+	_mtlCountBuffer = mvkCountBuffer->getMTLBuffer();
+	_mtlCountBufferOffset = mvkCountBuffer->getMTLBufferOffset() + countBufferOffset;
+
+	auto& mtlFeats = cmdBuff->getMetalFeatures();
+	if (!mtlFeats.indirectDrawing) {
+		return cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdDrawIndexedIndirectCount(): The current device does not support indirect drawing.");
+	}
+
+	return VK_SUCCESS;
+}
+
+void MVKCmdDrawIndexedIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
+	if (_maxDrawCount == 0) { return; }
+
+	cmdEncoder->restartMetalRenderPassIfNeeded();
+	auto* pipeline = cmdEncoder->getGraphicsPipeline();
+
+	if (pipeline->isTessellationPipeline() ||
+		pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+		return;
+	}
+
+	cmdEncoder->_isIndexedDraw = true;
+	id<MTLDevice> mtlDevice = cmdEncoder->getMTLDevice();
+
+	const MVKIndexMTLBufferBinding& ibb = cmdEncoder->getVkGraphics()._indexBuffer;
+	MTLIndexType mtlIdxType = (MTLIndexType)ibb.mtlIndexType;
+
+	MTLIndirectCommandBufferDescriptor* icbDesc = [MTLIndirectCommandBufferDescriptor new];
+	icbDesc.commandTypes = MTLIndirectCommandTypeDrawIndexed;
+	icbDesc.inheritPipelineState = YES;
+	icbDesc.inheritBuffers = YES;
+	icbDesc.maxVertexBufferBindCount = 0;
+	icbDesc.maxFragmentBufferBindCount = 0;
+
+	id<MTLIndirectCommandBuffer> icb =
+		[mtlDevice newIndirectCommandBufferWithDescriptor: icbDesc
+										  maxCommandCount: _maxDrawCount
+												  options: MTLResourceStorageModePrivate];
+	[icbDesc release];
+
+	[cmdEncoder->_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> cb) {
+		[icb release];
+	}];
+
+	auto* execRangeBuf = cmdEncoder->getTempMTLBuffer(sizeof(MTLIndirectCommandBufferExecutionRange), false);
+
+	auto* encPool = cmdEncoder->getCommandEncodingPool();
+	id<MTLComputePipelineState> mtlComputeState =
+		encPool->getCmdDrawIndirectCountICBMTLComputePipelineState(true, mtlIdxType);
+	id<MTLArgumentEncoder> argEnc =
+		encPool->getCmdDrawIndirectCountICBMTLArgumentEncoder(true, mtlIdxType);
+
+	auto* argBuf = cmdEncoder->getTempMTLBuffer(argEnc.encodedLength, false);
+	[argEnc setArgumentBuffer: argBuf->_mtlBuffer offset: argBuf->_offset];
+	[argEnc setIndirectCommandBuffer: icb atIndex: 0];
+
+	cmdEncoder->encodeStoreActions(true);
+	id<MTLComputeCommandEncoder> mtlComputeEnc =
+		cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDrawIndirectCountICB);
+
+	MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
+	state.bindPipeline(mtlComputeEnc, mtlComputeState);
+
+	uint32_t primType = (uint32_t)cmdEncoder->getMtlGraphics().getPrimitiveType();
+
+	state.bindBuffer(mtlComputeEnc, argBuf->_mtlBuffer,       argBuf->_offset,          0);
+	state.bindBuffer(mtlComputeEnc, _mtlIndirectBuffer,        _mtlIndirectBufferOffset, 1);
+	state.bindBuffer(mtlComputeEnc, _mtlCountBuffer,           _mtlCountBufferOffset,    2);
+	state.bindBuffer(mtlComputeEnc, execRangeBuf->_mtlBuffer, execRangeBuf->_offset,    3);
+	state.bindStructBytes(mtlComputeEnc, &_maxDrawCount,                                 4);
+	state.bindStructBytes(mtlComputeEnc, &_mtlIndirectBufferStride,                      5);
+	state.bindStructBytes(mtlComputeEnc, &primType,                                      6);
+	state.bindBuffer(mtlComputeEnc, ibb.mtlBuffer,             ibb.offset,               7);
+
+	[mtlComputeEnc useResource: icb usage: MTLResourceUsageWrite];
+	[mtlComputeEnc useResource: _mtlIndirectBuffer usage: MTLResourceUsageRead];
+	[mtlComputeEnc useResource: _mtlCountBuffer usage: MTLResourceUsageRead];
+	[mtlComputeEnc useResource: ibb.mtlBuffer usage: MTLResourceUsageRead];
+
+	[mtlComputeEnc dispatchThreads: MTLSizeMake(_maxDrawCount, 1, 1)
+			 threadsPerThreadgroup: MTLSizeMake(mtlComputeState.threadExecutionWidth, 1, 1)];
+
+	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+
+	cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);
+	if (!pipeline->hasValidMTLPipelineStates()) { return; }
+
+	[cmdEncoder->_mtlRenderEncoder useResource: icb usage: MTLResourceUsageRead];
+	[cmdEncoder->_mtlRenderEncoder executeCommandsInBuffer: icb
+											indirectBuffer: execRangeBuf->_mtlBuffer
+									  indirectBufferOffset: execRangeBuf->_offset];
 }
 
