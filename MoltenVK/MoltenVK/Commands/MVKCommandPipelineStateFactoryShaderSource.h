@@ -503,8 +503,22 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
 	dst[pos] = idx;
 }
 
+typedef struct {
+	uint16_t mtlIndex;
+	uint16_t argSlot;
+	uint32_t baseOffset;
+	uint32_t zeroDivStride;
+} ICBBufBind;
+
+typedef struct {
+	uint32_t vtxCount;
+	uint32_t fragCount;
+	ICBBufBind entries[16];
+} ICBRebindMeta;
+
 struct ICBContainer {
 	command_buffer icb [[id(0)]];
+	device uint8_t* bufs [[id(1)]] [16];
 };
 
 typedef struct {
@@ -520,6 +534,7 @@ kernel void cmdDrawIndirectCountICB(
 	constant uint32_t &maxDrawCount          [[buffer(4)]],
 	constant uint32_t &stride                [[buffer(5)]],
 	constant uint32_t &primType              [[buffer(6)]],
+	constant ICBRebindMeta &meta             [[buffer(7)]],
 	uint tid [[thread_position_in_grid]])
 {
 	if (tid == 0) {
@@ -531,6 +546,16 @@ kernel void cmdDrawIndirectCountICB(
 		render_command cmd(icbContainer->icb, tid);
 		const device auto *args =
 			(const device MTLDrawPrimitivesIndirectArguments *)(srcBuff + tid * stride);
+		for (uint32_t i = 0; i < meta.vtxCount; i++) {
+			constant auto &e = meta.entries[i];
+			uint32_t off = e.baseOffset;
+			if (e.zeroDivStride != 0) off += args->baseInstance * e.zeroDivStride;
+			cmd.set_vertex_buffer(icbContainer->bufs[e.argSlot] + off, e.mtlIndex);
+		}
+		for (uint32_t i = 0; i < meta.fragCount; i++) {
+			constant auto &e = meta.entries[meta.vtxCount + i];
+			cmd.set_fragment_buffer(icbContainer->bufs[e.argSlot] + e.baseOffset, e.mtlIndex);
+		}
 		cmd.draw_primitives(primitive_type(primType),
 						   args->vertexStart, args->vertexCount,
 						   args->instanceCount, args->baseInstance);
@@ -545,7 +570,8 @@ kernel void cmdDrawIndexedIndirectCountICB16(
 	constant uint32_t &maxDrawCount          [[buffer(4)]],
 	constant uint32_t &stride                [[buffer(5)]],
 	constant uint32_t &primType              [[buffer(6)]],
-	const device ushort *indexBuffer         [[buffer(7)]],
+	constant ICBRebindMeta &meta             [[buffer(7)]],
+	const device ushort *indexBuffer         [[buffer(8)]],
 	uint tid [[thread_position_in_grid]])
 {
 	if (tid == 0) {
@@ -557,6 +583,16 @@ kernel void cmdDrawIndexedIndirectCountICB16(
 		render_command cmd(icbContainer->icb, tid);
 		const device auto *args =
 			(const device MTLDrawIndexedPrimitivesIndirectArguments *)(srcBuff + tid * stride);
+		for (uint32_t i = 0; i < meta.vtxCount; i++) {
+			constant auto &e = meta.entries[i];
+			uint32_t off = e.baseOffset;
+			if (e.zeroDivStride != 0) off += args->baseInstance * e.zeroDivStride;
+			cmd.set_vertex_buffer(icbContainer->bufs[e.argSlot] + off, e.mtlIndex);
+		}
+		for (uint32_t i = 0; i < meta.fragCount; i++) {
+			constant auto &e = meta.entries[meta.vtxCount + i];
+			cmd.set_fragment_buffer(icbContainer->bufs[e.argSlot] + e.baseOffset, e.mtlIndex);
+		}
 		cmd.draw_indexed_primitives(primitive_type(primType),
 								   args->indexCount,
 								   indexBuffer + args->indexStart,
@@ -574,7 +610,8 @@ kernel void cmdDrawIndexedIndirectCountICB32(
 	constant uint32_t &maxDrawCount          [[buffer(4)]],
 	constant uint32_t &stride                [[buffer(5)]],
 	constant uint32_t &primType              [[buffer(6)]],
-	const device uint *indexBuffer           [[buffer(7)]],
+	constant ICBRebindMeta &meta             [[buffer(7)]],
+	const device uint *indexBuffer           [[buffer(8)]],
 	uint tid [[thread_position_in_grid]])
 {
 	if (tid == 0) {
@@ -586,6 +623,16 @@ kernel void cmdDrawIndexedIndirectCountICB32(
 		render_command cmd(icbContainer->icb, tid);
 		const device auto *args =
 			(const device MTLDrawIndexedPrimitivesIndirectArguments *)(srcBuff + tid * stride);
+		for (uint32_t i = 0; i < meta.vtxCount; i++) {
+			constant auto &e = meta.entries[i];
+			uint32_t off = e.baseOffset;
+			if (e.zeroDivStride != 0) off += args->baseInstance * e.zeroDivStride;
+			cmd.set_vertex_buffer(icbContainer->bufs[e.argSlot] + off, e.mtlIndex);
+		}
+		for (uint32_t i = 0; i < meta.fragCount; i++) {
+			constant auto &e = meta.entries[meta.vtxCount + i];
+			cmd.set_fragment_buffer(icbContainer->bufs[e.argSlot] + e.baseOffset, e.mtlIndex);
+		}
 		cmd.draw_indexed_primitives(primitive_type(primType),
 								   args->indexCount,
 								   indexBuffer + args->indexStart,

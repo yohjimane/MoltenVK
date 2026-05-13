@@ -182,9 +182,9 @@ id<MTLIndirectCommandBuffer> MVKCommandEncodingPool::getDrawIndirectCountICB(boo
 	MTLIndirectCommandBufferDescriptor* icbDesc = [MTLIndirectCommandBufferDescriptor new];
 	icbDesc.commandTypes = indexed ? MTLIndirectCommandTypeDrawIndexed : MTLIndirectCommandTypeDraw;
 	icbDesc.inheritPipelineState = YES;
-	icbDesc.inheritBuffers = YES;
-	icbDesc.maxVertexBufferBindCount = 0;
-	icbDesc.maxFragmentBufferBindCount = 0;
+	icbDesc.inheritBuffers = NO;
+	icbDesc.maxVertexBufferBindCount = _commandPool->getDevice()->getPhysicalDevice()->getMetalFeatures()->maxPerStageBufferCount;
+	icbDesc.maxFragmentBufferBindCount = _commandPool->getDevice()->getPhysicalDevice()->getMetalFeatures()->maxPerStageBufferCount;
 
 	_mtlDrawIndirectCountICB[idx] =
 		[_commandPool->getDevice()->getPhysicalDevice()->getMTLDevice() newIndirectCommandBufferWithDescriptor: icbDesc

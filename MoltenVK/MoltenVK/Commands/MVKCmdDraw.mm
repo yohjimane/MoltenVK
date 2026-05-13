@@ -1267,6 +1267,88 @@ VkResult MVKCmdDrawIndirectCount::setContent(MVKCommandBuffer* cmdBuff,
 	return VK_SUCCESS;
 }
 
+typedef struct {
+	uint16_t mtlIndex;
+	uint16_t argSlot;
+	uint32_t baseOffset;
+	uint32_t zeroDivStride;
+} ICBBufBindCPU;
+
+typedef struct {
+	uint32_t vtxCount;
+	uint32_t fragCount;
+	ICBBufBindCPU entries[16];
+} ICBRebindMetaCPU;
+
+static const MVKMTLBufferAllocation* _stageImplicitBuffer(
+	MVKCommandEncoder* cmdEncoder, MVKImplicitBuffer bufType,
+	MVKShaderStage stage, MVKGraphicsPipeline* pipeline) {
+	auto& vkState = cmdEncoder->getVkGraphics();
+	auto& vkShared = cmdEncoder->getState().vkShared();
+	auto& implData = vkState._implicitBufferData[stage];
+	auto& resCounts = pipeline->getLayout()->getResourceCounts().stages[stage];
+	const uint8_t* data = nullptr; size_t size = 0;
+	switch (static_cast<MVKNonVolatileImplicitBuffer>(bufType)) {
+		case MVKNonVolatileImplicitBuffer::PushConstant:
+			size = pipeline->getLayout()->getPushConstantsLength();
+			data = vkShared._pushConstants.data(); break;
+		case MVKNonVolatileImplicitBuffer::BufferSize: {
+			size_t limit = std::min((size_t)implData.bufferSizes.size(), (size_t)resCounts.bufferIndex);
+			size = limit * sizeof(uint32_t);
+			data = reinterpret_cast<const uint8_t*>(implData.bufferSizes.data()); break;
+		}
+		case MVKNonVolatileImplicitBuffer::DynamicOffset: {
+			size_t limit = std::min((size_t)implData.dynamicOffsets.size(), (size_t)resCounts.dynamicOffsetBufferIndex);
+			size = limit * sizeof(uint32_t);
+			data = reinterpret_cast<const uint8_t*>(implData.dynamicOffsets.data()); break;
+		}
+		case MVKNonVolatileImplicitBuffer::ViewRange: {
+			uint32_t vr[2];
+			vr[0] = cmdEncoder->getSubpass()->getFirstViewIndexInMetalPass(cmdEncoder->getMultiviewPassIndex());
+			vr[1] = cmdEncoder->getSubpass()->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex());
+			size = sizeof(vr); data = reinterpret_cast<const uint8_t*>(vr); break;
+		}
+		default: return nullptr;
+	}
+	if (!data || size == 0) return nullptr;
+	auto* staged = cmdEncoder->getTempMTLBuffer(size, false);
+	memcpy((char*)staged->_mtlBuffer.contents + staged->_offset, data, size);
+	return staged;
+}
+
+static void _collectBindings(MVKCommandEncoder* cmdEncoder, MVKGraphicsPipeline* pipeline,
+	const MVKStageResourceBits& exists, const MVKStageResourceBindings& bindings,
+	MVKShaderStage stage, MVKArrayRef<MVKZeroDivisorVertexBinding> zeroDivBindings,
+	ICBRebindMetaCPU& meta, uint32_t& idx, MVKSmallVector<id<MTLBuffer>, 16>& uniqueBufs, bool isVertex) {
+	auto findOrAddBuf = [&](id<MTLBuffer> buf) -> uint16_t {
+		for (uint16_t i = 0; i < uniqueBufs.size(); i++) if (uniqueBufs[i] == buf) return i;
+		uint16_t s = (uint16_t)uniqueBufs.size(); uniqueBufs.push_back(buf); return s;
+	};
+	for (size_t i : exists.buffers) {
+		auto& b = bindings.buffers[i];
+		if (b.buffer) {
+			auto& e = meta.entries[idx]; e.mtlIndex = (uint16_t)i;
+			e.argSlot = findOrAddBuf(b.buffer); e.baseOffset = (uint32_t)b.offset;
+			e.zeroDivStride = 0;
+			if (isVertex) {
+				for (auto& zb : zeroDivBindings) {
+					if (pipeline->getMetalBufferIndexForVertexAttributeBinding(zb.first) == i) {
+						e.zeroDivStride = zb.second; break;
+					}
+				}
+			}
+			idx++;
+		} else if (b.offset != 0) {
+			auto* staged = _stageImplicitBuffer(cmdEncoder, static_cast<MVKImplicitBuffer>(b.offset - 1), stage, pipeline);
+			if (staged) {
+				auto& e = meta.entries[idx]; e.mtlIndex = (uint16_t)i;
+				e.argSlot = findOrAddBuf(staged->_mtlBuffer); e.baseOffset = (uint32_t)staged->_offset;
+				e.zeroDivStride = 0; idx++;
+			}
+		}
+	}
+}
+
 static void _encodeDrawIndirectCountICB(MVKCommandEncoder* cmdEncoder,
 										id<MTLBuffer> mtlIndirectBuffer,
 										VkDeviceSize mtlIndirectBufferOffset,
@@ -1279,10 +1361,24 @@ static void _encodeDrawIndirectCountICB(MVKCommandEncoder* cmdEncoder,
 										id<MTLBuffer> mtlIndexBuffer,
 										VkDeviceSize mtlIndexBufferOffset) {
 
+	cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);
+	auto* pipeline = cmdEncoder->getGraphicsPipeline();
+	if (!pipeline->hasValidMTLPipelineStates()) { return; }
+	auto& mtlGfx = cmdEncoder->getMtlGraphics();
+
+	ICBRebindMetaCPU meta = {};
+	MVKSmallVector<id<MTLBuffer>, 16> uniqueBufs;
+	auto zeroDivBindings = pipeline->getZeroDivisorVertexBindings();
+	uint32_t idx = 0;
+	_collectBindings(cmdEncoder, pipeline, mtlGfx._exists.vertex(), mtlGfx._bindings.vertex(),
+					 kMVKShaderStageVertex, zeroDivBindings, meta, idx, uniqueBufs, true);
+	meta.vtxCount = idx;
+	_collectBindings(cmdEncoder, pipeline, mtlGfx._exists.fragment(), mtlGfx._bindings.fragment(),
+					 kMVKShaderStageFragment, zeroDivBindings, meta, idx, uniqueBufs, false);
+	meta.fragCount = idx - meta.vtxCount;
+
 	auto* encPool = cmdEncoder->getCommandEncodingPool();
 	id<MTLIndirectCommandBuffer> icb = encPool->getDrawIndirectCountICB(indexed, maxDrawCount);
-
-	auto* execRangeBuf = cmdEncoder->getTempMTLBuffer(sizeof(MTLIndirectCommandBufferExecutionRange), false);
 
 	id<MTLComputePipelineState> mtlComputeState =
 		encPool->getCmdDrawIndirectCountICBMTLComputePipelineState(indexed, mtlIdxType);
@@ -1292,43 +1388,48 @@ static void _encodeDrawIndirectCountICB(MVKCommandEncoder* cmdEncoder,
 	auto* argBuf = cmdEncoder->getTempMTLBuffer(argEnc.encodedLength, false);
 	[argEnc setArgumentBuffer: argBuf->_mtlBuffer offset: argBuf->_offset];
 	[argEnc setIndirectCommandBuffer: icb atIndex: 0];
+	for (uint16_t s = 0; s < uniqueBufs.size(); s++) {
+		[argEnc setBuffer: uniqueBufs[s] offset: 0 atIndex: s + 1];
+	}
+
+	auto* metaBuf = cmdEncoder->getTempMTLBuffer(sizeof(ICBRebindMetaCPU), false);
+	memcpy((char*)metaBuf->_mtlBuffer.contents + metaBuf->_offset, &meta, sizeof(meta));
+	auto* execRangeBuf = cmdEncoder->getTempMTLBuffer(sizeof(MTLIndirectCommandBufferExecutionRange), false);
 
 	cmdEncoder->encodeStoreActions(true);
 	id<MTLComputeCommandEncoder> mtlComputeEnc =
 		cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDrawIndirectCountICB);
+	MVKMetalComputeCommandEncoderState& compState = cmdEncoder->getMtlCompute();
+	compState.bindPipeline(mtlComputeEnc, mtlComputeState);
 
-	MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
-	state.bindPipeline(mtlComputeEnc, mtlComputeState);
-
-	uint32_t primType = (uint32_t)cmdEncoder->getMtlGraphics().getPrimitiveType();
-
-	state.bindBuffer(mtlComputeEnc, argBuf->_mtlBuffer,       argBuf->_offset,          0);
-	state.bindBuffer(mtlComputeEnc, mtlIndirectBuffer,         mtlIndirectBufferOffset,  1);
-	state.bindBuffer(mtlComputeEnc, mtlCountBuffer,            mtlCountBufferOffset,     2);
-	state.bindBuffer(mtlComputeEnc, execRangeBuf->_mtlBuffer, execRangeBuf->_offset,    3);
-	state.bindStructBytes(mtlComputeEnc, &maxDrawCount,                                  4);
-	state.bindStructBytes(mtlComputeEnc, &mtlIndirectBufferStride,                       5);
-	state.bindStructBytes(mtlComputeEnc, &primType,                                      6);
+	uint32_t primType = (uint32_t)mtlGfx.getPrimitiveType();
+	compState.bindBuffer(mtlComputeEnc, argBuf->_mtlBuffer,       argBuf->_offset,          0);
+	compState.bindBuffer(mtlComputeEnc, mtlIndirectBuffer,         mtlIndirectBufferOffset,  1);
+	compState.bindBuffer(mtlComputeEnc, mtlCountBuffer,            mtlCountBufferOffset,     2);
+	compState.bindBuffer(mtlComputeEnc, execRangeBuf->_mtlBuffer, execRangeBuf->_offset,    3);
+	compState.bindStructBytes(mtlComputeEnc, &maxDrawCount,                                  4);
+	compState.bindStructBytes(mtlComputeEnc, &mtlIndirectBufferStride,                       5);
+	compState.bindStructBytes(mtlComputeEnc, &primType,                                      6);
+	compState.bindBuffer(mtlComputeEnc, metaBuf->_mtlBuffer,      metaBuf->_offset,          7);
 	if (indexed) {
-		state.bindBuffer(mtlComputeEnc, mtlIndexBuffer,        mtlIndexBufferOffset,     7);
+		compState.bindBuffer(mtlComputeEnc, mtlIndexBuffer,        mtlIndexBufferOffset,     8);
 	}
 
 	[mtlComputeEnc useResource: icb usage: MTLResourceUsageWrite];
 	[mtlComputeEnc useResource: mtlIndirectBuffer usage: MTLResourceUsageRead];
 	[mtlComputeEnc useResource: mtlCountBuffer usage: MTLResourceUsageRead];
-	if (indexed) {
-		[mtlComputeEnc useResource: mtlIndexBuffer usage: MTLResourceUsageRead];
-	}
+	if (indexed) { [mtlComputeEnc useResource: mtlIndexBuffer usage: MTLResourceUsageRead]; }
+	for (auto buf : uniqueBufs) { [mtlComputeEnc useResource: buf usage: MTLResourceUsageRead]; }
 
 	[mtlComputeEnc dispatchThreads: MTLSizeMake(maxDrawCount, 1, 1)
 			 threadsPerThreadgroup: MTLSizeMake(mtlComputeState.threadExecutionWidth, 1, 1)];
 
 	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
-
 	cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);
-	if (!cmdEncoder->getGraphicsPipeline()->hasValidMTLPipelineStates()) { return; }
+	if (!pipeline->hasValidMTLPipelineStates()) { return; }
 
 	[cmdEncoder->_mtlRenderEncoder useResource: icb usage: MTLResourceUsageRead];
+	for (auto buf : uniqueBufs) { [cmdEncoder->_mtlRenderEncoder useResource: buf usage: MTLResourceUsageRead]; }
 	[cmdEncoder->_mtlRenderEncoder executeCommandsInBuffer: icb
 											indirectBuffer: execRangeBuf->_mtlBuffer
 									  indirectBufferOffset: execRangeBuf->_offset];
