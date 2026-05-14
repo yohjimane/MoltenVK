@@ -1678,6 +1678,19 @@ void MVKCmdDrawIndexedIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 	cmdEncoder->_isIndexedDraw = true;
 
 	if (pipeline->isTessellationPipeline()) {
+		static uint32_t _tessFrameNum = 0;
+		static id<MTLSharedEvent> _tessEvent = nil;
+		static MTLSharedEventListener* _tessListener = nil;
+		uint64_t _tessEncodeStart = mvkGetTimestamp();
+
+		if (!_tessEvent) {
+			_tessEvent = [cmdEncoder->getMTLDevice() newSharedEvent];
+			dispatch_queue_t q = dispatch_queue_create("mvk.tess-timing",
+				dispatch_queue_attr_make_with_qos_class(NULL, QOS_CLASS_USER_INTERACTIVE, 0));
+			_tessListener = [[MTLSharedEventListener alloc] initWithDispatchQueue: q];
+			NSLog(@"[MVK-tess-timing] GPU event timer ready (dedicated queue)");
+		}
+
 		const MVKIndexMTLBufferBinding& ibb = cmdEncoder->getVkGraphics()._indexBuffer;
 		uint32_t inControlPointCount = cmdEncoder->getVkGraphics().getPatchControlPoints();
 		uint32_t outControlPointCount = pipeline->getOutputControlPointCount();
@@ -1749,11 +1762,37 @@ void MVKCmdDrawIndexedIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 		[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(_maxDrawCount, mtlConvertState.threadExecutionWidth), 1, 1)
 						  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
 
+		uint64_t tessStartVal = (uint64_t)_tessFrameNum * 2 + 1;
+		uint64_t tessEndVal = tessStartVal + 1;
+
+		_tessFrameNum++;
+		uint32_t frameNum = _tessFrameNum;
+		bool shouldLog = (frameNum <= 10 || frameNum % 30 == 0);
+
+		// Register listeners BEFORE encoding so they're waiting when the GPU signals.
+		__block uint64_t gpuStartWall = 0;
+		if (shouldLog) {
+			[_tessEvent notifyListener: _tessListener atValue: tessStartVal block: ^(id<MTLSharedEvent> ev, uint64_t val) {
+				gpuStartWall = mvkGetTimestamp();
+			}];
+			[_tessEvent notifyListener: _tessListener atValue: tessEndVal block: ^(id<MTLSharedEvent> ev, uint64_t val) {
+				double gpuTessMs = mvkGetElapsedMilliseconds(gpuStartWall);
+				NSLog(@"[MVK-tess-timing] frame=%u gpuTess=%.2f batch=%u",
+					  frameNum, gpuTessMs, batchSize);
+			}];
+		}
+
 		for (uint32_t batchStart = 0; batchStart < _maxDrawCount; batchStart += batchSize) {
 			uint32_t batchEnd = std::min(batchStart + batchSize, _maxDrawCount);
 
 			// Phase 1: all compute work in one encoder.
 			cmdEncoder->encodeStoreActions(true);
+
+			if (batchStart == 0) {
+				cmdEncoder->endCurrentMetalEncoding();
+				[cmdEncoder->_mtlCmdBuffer encodeSignalEvent: _tessEvent value: tessStartVal];
+			}
+
 			mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
 
 			for (uint32_t drawIdx = batchStart; drawIdx < batchEnd; drawIdx++) {
@@ -1761,13 +1800,16 @@ void MVKCmdDrawIndexedIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 				VkDeviceSize drawIndOfst = tempIndirectBuff->_offset + drawIdx * indirectPerDraw;
 				VkDeviceSize drawSrcOfst = _mtlIndirectBufferOffset + drawIdx * _mtlIndirectBufferStride;
 
-				// Index copy (direct Metal calls to avoid state tracker interference).
+				// Index copy — use indirect dispatch matching the vertex shader args so draws
+				// beyond the actual count (from count buffer) dispatch 0 threadgroups.
+				VkDeviceSize vtxDispatchOfst = drawIndOfst + sizeof(MTLStageInRegionIndirectArguments);
 				[mtlTessCtlEncoder setComputePipelineState: encPool->getCmdDrawIndexedCopyIndexBufferMTLComputePipelineState((MTLIndexType)ibb.mtlIndexType)];
 				[mtlTessCtlEncoder setBuffer: ibb.mtlBuffer      offset: ibb.offset               atIndex: 0];
 				[mtlTessCtlEncoder setBuffer: bufs.vtxIdx        offset: slotIdx * vtxIndexPerDraw atIndex: 1];
 				[mtlTessCtlEncoder setBuffer: _mtlIndirectBuffer offset: drawSrcOfst               atIndex: 2];
-				[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(vertexCount, vtxThreadExecWidth), 1, 1)
-								  threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
+				[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
+													 indirectBufferOffset: vtxDispatchOfst
+													threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
 
 				cmdEncoder->finalizeDrawState(kMVKGraphicsStageVertex);
 				if (!pipeline->hasValidMTLPipelineStates()) { return; }
@@ -1853,6 +1895,17 @@ void MVKCmdDrawIndexedIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 										  indirectBufferOffset: drawIndOfst];
 				}
 			}
+		}
+
+		cmdEncoder->endCurrentMetalEncoding();
+		[cmdEncoder->_mtlCmdBuffer encodeSignalEvent: _tessEvent value: tessEndVal];
+
+		if (shouldLog) {
+			double cpuMs = mvkGetElapsedMilliseconds(_tessEncodeStart);
+			[cmdEncoder->_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> buf) {
+				double gpuTotalMs = (buf.GPUEndTime - buf.GPUStartTime) * 1000.0;
+				NSLog(@"[MVK-tess-timing] frame=%u cpuEncode=%.2f gpuCmdBuf=%.2f", frameNum, cpuMs, gpuTotalMs);
+			}];
 		}
 		return;
 	}

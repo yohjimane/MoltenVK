@@ -214,7 +214,7 @@ MVKCommandEncodingPool::getTessOutputBuffers(bool indexed,
 		if (need == 0) return;
 		if (buf && cap >= need) return;
 		[buf release];
-		buf = [mtlDev newBufferWithLength: (NSUInteger)need options: MTLResourceStorageModeShared];
+		buf = [mtlDev newBufferWithLength: (NSUInteger)need options: MTLResourceStorageModePrivate];
 		cap = need;
 	};
 
