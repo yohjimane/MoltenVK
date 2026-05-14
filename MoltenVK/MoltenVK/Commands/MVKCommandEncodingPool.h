@@ -139,6 +139,21 @@ public:
 	/** Returns a cached ICB for DrawIndirectCount, growing if needed. [0]=draw, [1]=drawIndexed. */
 	id<MTLIndirectCommandBuffer> getDrawIndirectCountICB(bool indexed, uint32_t maxCommandCount);
 
+	/** Pooled tessellation output buffers returned by getTessOutputBuffers(). */
+	struct TessOutputBuffers {
+		id<MTLBuffer> vtxOut;
+		id<MTLBuffer> tcOut;
+		id<MTLBuffer> tcPatchOut;
+		id<MTLBuffer> tcLevel;
+		id<MTLBuffer> vtxIdx;
+	};
+
+	/** Returns pooled tessellation output buffers for IndirectCount draws, growing if needed. */
+	TessOutputBuffers getTessOutputBuffers(bool indexed,
+		VkDeviceSize vtxOutSize, VkDeviceSize tcOutSize,
+		VkDeviceSize tcPatchOutSize, VkDeviceSize tcLevelSize,
+		VkDeviceSize vtxIdxSize);
+
 	/** Returns a MTLComputePipelineState for copying query results to a buffer. */
 	id<MTLComputePipelineState> getCmdCopyQueryPoolResultsMTLComputePipelineState();
 
@@ -193,5 +208,19 @@ protected:
 	id<MTLArgumentEncoder> _mtlDrawIndirectCountICBArgumentEncoder[3] = {nil, nil, nil};
 	id<MTLIndirectCommandBuffer> _mtlDrawIndirectCountICB[2] = {nil, nil};
 	uint32_t _mtlDrawIndirectCountICBCapacity[2] = {0, 0};
+
+	struct TessOutputBufferPool {
+		id<MTLBuffer> vtxOut = nil;
+		id<MTLBuffer> tcOut = nil;
+		id<MTLBuffer> tcPatchOut = nil;
+		id<MTLBuffer> tcLevel = nil;
+		id<MTLBuffer> vtxIdx = nil;
+		VkDeviceSize vtxOutCap = 0;
+		VkDeviceSize tcOutCap = 0;
+		VkDeviceSize tcPatchOutCap = 0;
+		VkDeviceSize tcLevelCap = 0;
+		VkDeviceSize vtxIdxCap = 0;
+	};
+	TessOutputBufferPool _tessOutputPool[2];
 };
 

@@ -200,6 +200,33 @@ id<MTLIndirectCommandBuffer> MVKCommandEncodingPool::getDrawIndirectCountICB(boo
 	return _mtlDrawIndirectCountICB[idx];
 }
 
+MVKCommandEncodingPool::TessOutputBuffers
+MVKCommandEncodingPool::getTessOutputBuffers(bool indexed,
+	VkDeviceSize vtxOutSize, VkDeviceSize tcOutSize,
+	VkDeviceSize tcPatchOutSize, VkDeviceSize tcLevelSize,
+	VkDeviceSize vtxIdxSize)
+{
+	lock_guard<mutex> lock(_lock);
+	auto& p = _tessOutputPool[indexed ? 1 : 0];
+	id<MTLDevice> mtlDev = _commandPool->getDevice()->getPhysicalDevice()->getMTLDevice();
+
+	auto grow = [&](id<MTLBuffer>& buf, VkDeviceSize& cap, VkDeviceSize need) {
+		if (need == 0) return;
+		if (buf && cap >= need) return;
+		[buf release];
+		buf = [mtlDev newBufferWithLength: (NSUInteger)need options: MTLResourceStorageModeShared];
+		cap = need;
+	};
+
+	grow(p.vtxOut,     p.vtxOutCap,     vtxOutSize);
+	grow(p.tcOut,      p.tcOutCap,      tcOutSize);
+	grow(p.tcPatchOut, p.tcPatchOutCap, tcPatchOutSize);
+	grow(p.tcLevel,    p.tcLevelCap,    tcLevelSize);
+	grow(p.vtxIdx,     p.vtxIdxCap,     vtxIdxSize);
+
+	return { p.vtxOut, p.tcOut, p.tcPatchOut, p.tcLevel, p.vtxIdx };
+}
+
 id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdCopyQueryPoolResultsMTLComputePipelineState() {
 	MVK_ENC_REZ_ACCESS(_mtlCopyQueryPoolResultsComputePipelineState, newCmdCopyQueryPoolResultsMTLComputePipelineState(_commandPool));
 }
@@ -321,6 +348,15 @@ void MVKCommandEncodingPool::destroyMetalResources() {
 		[_mtlDrawIndirectCountICB[i] release];
 		_mtlDrawIndirectCountICB[i] = nil;
 		_mtlDrawIndirectCountICBCapacity[i] = 0;
+	}
+
+	for (uint32_t i = 0; i < 2; i++) {
+		[_tessOutputPool[i].vtxOut release];
+		[_tessOutputPool[i].tcOut release];
+		[_tessOutputPool[i].tcPatchOut release];
+		[_tessOutputPool[i].tcLevel release];
+		[_tessOutputPool[i].vtxIdx release];
+		_tessOutputPool[i] = {};
 	}
 }
 

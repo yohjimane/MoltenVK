@@ -19,6 +19,7 @@
 #include "MVKCmdDraw.h"
 #include "MVKCommandBuffer.h"
 #include "MVKCommandPool.h"
+#include "MVKCommandEncodingPool.h"
 #include "MVKBuffer.h"
 #include "MVKPipeline.h"
 #include "MVKFoundation.h"
@@ -1461,27 +1462,7 @@ void MVKCmdDrawIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 		uint32_t outControlPointCount = pipeline->getOutputControlPointCount();
 		uint32_t vertexCount = kMVKMaxDrawIndirectCountVertexCount;
 		uint32_t patchCount = mvkCeilingDivide(vertexCount, inControlPointCount);
-		VkDeviceSize indirectSize = (2 * sizeof(MTLDispatchThreadgroupsIndirectArguments) + sizeof(MTLDrawPatchIndirectArguments) + sizeof(MTLStageInRegionIndirectArguments)) * _maxDrawCount;
 		VkDeviceSize paramsIncr = std::max((size_t)dvcLimits.minUniformBufferOffsetAlignment, sizeof(uint32_t) * 2);
-		VkDeviceSize paramsSize = paramsIncr * _maxDrawCount;
-		auto* tempIndirectBuff = cmdEncoder->getTempMTLBuffer(indirectSize, true);
-		id<MTLBuffer> mtlIndBuff = tempIndirectBuff->_mtlBuffer;
-		VkDeviceSize mtlIndBuffOfst = tempIndirectBuff->_offset;
-		auto* tcParamsBuff = cmdEncoder->getTempMTLBuffer(paramsSize, true);
-		VkDeviceSize mtlParmBuffOfst = tcParamsBuff->_offset;
-		const MVKMTLBufferAllocation* vtxOutBuff = nullptr;
-		const MVKMTLBufferAllocation* tcOutBuff = nullptr;
-		const MVKMTLBufferAllocation* tcPatchOutBuff = nullptr;
-		if (pipeline->needsVertexOutputBuffer()) {
-			vtxOutBuff = cmdEncoder->getTempMTLBuffer(vertexCount * 4 * dvcLimits.maxVertexOutputComponents, true);
-		}
-		if (pipeline->needsTessCtlOutputBuffer()) {
-			tcOutBuff = cmdEncoder->getTempMTLBuffer(outControlPointCount * patchCount * 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents, true);
-		}
-		if (pipeline->needsTessCtlPatchOutputBuffer()) {
-			tcPatchOutBuff = cmdEncoder->getTempMTLBuffer(patchCount * 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents, true);
-		}
-		auto* tcLevelBuff = cmdEncoder->getTempMTLBuffer(patchCount * sizeof(MTLQuadTessellationFactorsHalf), true);
 
 		NSUInteger vtxThreadExecWidth = pipeline->getTessVertexStageState().threadExecutionWidth;
 		NSUInteger sgSize = pipeline->getTessControlStageState().threadExecutionWidth;
@@ -1491,115 +1472,152 @@ void MVKCmdDrawIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 			tcWorkgroupSize = mvkLeastCommonMultiple(outControlPointCount, sgSize);
 		}
 
-		MVKPiplineStages stages;
-		pipeline->getStages(stages);
+		uint32_t vtxOutStride = pipeline->getVertexOutputStride();
+		if (vtxOutStride == 0) vtxOutStride = 4 * dvcLimits.maxVertexOutputComponents;
+		uint32_t tcPerVtxStride = pipeline->getTessCtlPerVertexOutputStride();
+		if (tcPerVtxStride == 0) tcPerVtxStride = 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents;
+		uint32_t tcPerPatchStride = pipeline->getTessCtlPerPatchOutputStride();
+		if (tcPerPatchStride == 0) tcPerPatchStride = 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents;
 
-		for (uint32_t drawIdx = 0; drawIdx < _maxDrawCount; drawIdx++) {
-			for (uint32_t s : stages) {
-				auto stage = MVKGraphicsStage(s);
-				id<MTLComputeCommandEncoder> mtlTessCtlEncoder = nil;
-				if (drawIdx == 0 && stage == kMVKGraphicsStageVertex) {
-					cmdEncoder->encodeStoreActions(true);
-					mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
-					id<MTLComputePipelineState> mtlConvertState = cmdEncoder->getCommandEncodingPool()->getCmdDrawIndirectCountTessConvertBuffersMTLComputePipelineState(false);
-					MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
-					state.bindPipeline(mtlTessCtlEncoder, mtlConvertState);
-					state.bindBuffer(mtlTessCtlEncoder, _mtlIndirectBuffer,           _mtlIndirectBufferOffset,  0);
-					state.bindBuffer(mtlTessCtlEncoder, tempIndirectBuff->_mtlBuffer, tempIndirectBuff->_offset, 1);
-					state.bindBuffer(mtlTessCtlEncoder, tcParamsBuff->_mtlBuffer,     tcParamsBuff->_offset,     2);
-					state.bindStructBytes(mtlTessCtlEncoder, &_mtlIndirectBufferStride, 3);
-					state.bindStructBytes(mtlTessCtlEncoder, &inControlPointCount,      4);
-					state.bindStructBytes(mtlTessCtlEncoder, &outControlPointCount,     5);
-					state.bindStructBytes(mtlTessCtlEncoder, &_maxDrawCount,            6);
-					state.bindStructBytes(mtlTessCtlEncoder, &vtxThreadExecWidth,       7);
-					state.bindStructBytes(mtlTessCtlEncoder, &tcWorkgroupSize,          8);
-					state.bindBuffer(mtlTessCtlEncoder, _mtlCountBuffer,               _mtlCountBufferOffset,    9);
-					state.bindStructBytes(mtlTessCtlEncoder, &paramsIncr,               10);
-					if (mtlFeats.nonUniformThreadgroups) {
-						[mtlTessCtlEncoder dispatchThreads: MTLSizeMake(_maxDrawCount, 1, 1)
-									 threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
-					} else {
-						[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(_maxDrawCount, mtlConvertState.threadExecutionWidth), 1, 1)
-										  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
-					}
+		static constexpr VkDeviceSize kBufAlign = 256;
+		VkDeviceSize vtxOutPerDraw = pipeline->needsVertexOutputBuffer() ? mvkAlignByteCount(vertexCount * vtxOutStride, kBufAlign) : 0;
+		VkDeviceSize tcOutPerDraw = pipeline->needsTessCtlOutputBuffer() ? mvkAlignByteCount(outControlPointCount * patchCount * tcPerVtxStride, kBufAlign) : 0;
+		VkDeviceSize tcPatchOutPerDraw = pipeline->needsTessCtlPatchOutputBuffer() ? mvkAlignByteCount(patchCount * tcPerPatchStride, kBufAlign) : 0;
+		VkDeviceSize tcLevelPerDraw = mvkAlignByteCount(patchCount * sizeof(MTLQuadTessellationFactorsHalf), kBufAlign);
+		VkDeviceSize perDrawOutputSize = vtxOutPerDraw + tcOutPerDraw + tcPatchOutPerDraw + tcLevelPerDraw;
+
+		static constexpr VkDeviceSize kTessBatchMemBudget = 64 * 1024 * 1024;
+		uint32_t batchSize = perDrawOutputSize > 0
+			? std::max(1u, (uint32_t)(kTessBatchMemBudget / perDrawOutputSize))
+			: _maxDrawCount;
+		batchSize = std::min(batchSize, _maxDrawCount);
+
+		VkDeviceSize indirectPerDraw = sizeof(MTLStageInRegionIndirectArguments) + 2 * sizeof(MTLDispatchThreadgroupsIndirectArguments) + sizeof(MTLDrawPatchIndirectArguments);
+
+		auto* tempIndirectBuff = cmdEncoder->getTempMTLBuffer(indirectPerDraw * _maxDrawCount, true);
+		id<MTLBuffer> mtlIndBuff = tempIndirectBuff->_mtlBuffer;
+		auto* tcParamsBuff = cmdEncoder->getTempMTLBuffer(paramsIncr * _maxDrawCount, true);
+
+		auto* encPool = cmdEncoder->getCommandEncodingPool();
+		auto bufs = encPool->getTessOutputBuffers(false,
+			vtxOutPerDraw * batchSize, tcOutPerDraw * batchSize,
+			tcPatchOutPerDraw * batchSize, tcLevelPerDraw * batchSize, 0);
+
+		// Convert kernel: once for all draws.
+		cmdEncoder->encodeStoreActions(true);
+		id<MTLComputeCommandEncoder> mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+		id<MTLComputePipelineState> mtlConvertState = encPool->getCmdDrawIndirectCountTessConvertBuffersMTLComputePipelineState(false);
+		MVKMetalComputeCommandEncoderState& compState = cmdEncoder->getMtlCompute();
+		compState.bindPipeline(mtlTessCtlEncoder, mtlConvertState);
+		compState.bindBuffer(mtlTessCtlEncoder, _mtlIndirectBuffer,           _mtlIndirectBufferOffset,  0);
+		compState.bindBuffer(mtlTessCtlEncoder, tempIndirectBuff->_mtlBuffer, tempIndirectBuff->_offset, 1);
+		compState.bindBuffer(mtlTessCtlEncoder, tcParamsBuff->_mtlBuffer,     tcParamsBuff->_offset,     2);
+		compState.bindStructBytes(mtlTessCtlEncoder, &_mtlIndirectBufferStride, 3);
+		compState.bindStructBytes(mtlTessCtlEncoder, &inControlPointCount,      4);
+		compState.bindStructBytes(mtlTessCtlEncoder, &outControlPointCount,     5);
+		compState.bindStructBytes(mtlTessCtlEncoder, &_maxDrawCount,            6);
+		compState.bindStructBytes(mtlTessCtlEncoder, &vtxThreadExecWidth,       7);
+		compState.bindStructBytes(mtlTessCtlEncoder, &tcWorkgroupSize,          8);
+		compState.bindBuffer(mtlTessCtlEncoder, _mtlCountBuffer,               _mtlCountBufferOffset,    9);
+		compState.bindStructBytes(mtlTessCtlEncoder, &paramsIncr,               10);
+		if (mtlFeats.nonUniformThreadgroups) {
+			[mtlTessCtlEncoder dispatchThreads: MTLSizeMake(_maxDrawCount, 1, 1)
+						 threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+		} else {
+			[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(_maxDrawCount, mtlConvertState.threadExecutionWidth), 1, 1)
+							  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+		}
+
+		for (uint32_t batchStart = 0; batchStart < _maxDrawCount; batchStart += batchSize) {
+			uint32_t batchEnd = std::min(batchStart + batchSize, _maxDrawCount);
+
+			// Phase 1: all compute work in one encoder.
+			cmdEncoder->encodeStoreActions(true);
+			mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+
+			for (uint32_t drawIdx = batchStart; drawIdx < batchEnd; drawIdx++) {
+				uint32_t slotIdx = drawIdx - batchStart;
+				VkDeviceSize drawIndOfst = tempIndirectBuff->_offset + drawIdx * indirectPerDraw;
+
+				cmdEncoder->finalizeDrawState(kMVKGraphicsStageVertex);
+				if (!pipeline->hasValidMTLPipelineStates()) { return; }
+				mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+				if (bufs.vtxOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.vtxOut
+										  offset: slotIdx * vtxOutPerDraw
+										 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Output]];
 				}
+				[mtlTessCtlEncoder setStageInRegion: MTLRegionMake2D(0, 0, vertexCount, vertexCount)];
+				[mtlTessCtlEncoder setStageInRegionWithIndirectBuffer: mtlIndBuff
+					                             indirectBufferOffset: drawIndOfst];
+				drawIndOfst += sizeof(MTLStageInRegionIndirectArguments);
+				[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
+													 indirectBufferOffset: drawIndOfst
+													threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
+				drawIndOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
 
-				cmdEncoder->finalizeDrawState(stage);
+				cmdEncoder->finalizeDrawState(kMVKGraphicsStageTessControl);
+				if (!pipeline->hasValidMTLPipelineStates()) { return; }
+				mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+				if (bufs.tcOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.tcOut
+										  offset: slotIdx * tcOutPerDraw
+										 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::Output]];
+				}
+				if (bufs.tcPatchOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.tcPatchOut
+										  offset: slotIdx * tcPatchOutPerDraw
+										 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::PatchOutput]];
+				}
+				[mtlTessCtlEncoder setBuffer: bufs.tcLevel
+									  offset: slotIdx * tcLevelPerDraw
+									 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::TessLevel]];
+				[mtlTessCtlEncoder setBuffer: tcParamsBuff->_mtlBuffer
+									  offset: tcParamsBuff->_offset + drawIdx * paramsIncr
+									 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::IndirectParams]];
+				if (bufs.vtxOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.vtxOut
+										  offset: slotIdx * vtxOutPerDraw
+										 atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessCtlInputBufferBinding)];
+				}
+				[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
+													 indirectBufferOffset: drawIndOfst
+													threadsPerThreadgroup: MTLSizeMake(tcWorkgroupSize, 1, 1)];
+			}
+
+			// Phase 2: all rasterization in one render pass.
+			cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+
+			for (uint32_t drawIdx = batchStart; drawIdx < batchEnd; drawIdx++) {
+				uint32_t slotIdx = drawIdx - batchStart;
+				VkDeviceSize drawIndOfst = tempIndirectBuff->_offset + drawIdx * indirectPerDraw
+					+ sizeof(MTLStageInRegionIndirectArguments) + 2 * sizeof(MTLDispatchThreadgroupsIndirectArguments);
+
+				cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);
 				if (!pipeline->hasValidMTLPipelineStates()) { return; }
 
-				switch (stage) {
-					case kMVKGraphicsStageVertex:
-						mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
-						if (pipeline->needsVertexOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: vtxOutBuff->_mtlBuffer
-												  offset: vtxOutBuff->_offset
-												 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Output]];
-						}
-						[mtlTessCtlEncoder setStageInRegion: MTLRegionMake2D(0, 0, vertexCount, vertexCount)];
-						[mtlTessCtlEncoder setStageInRegionWithIndirectBuffer: mtlIndBuff
-							                             indirectBufferOffset: mtlIndBuffOfst];
-						mtlIndBuffOfst += sizeof(MTLStageInRegionIndirectArguments);
-						[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
-															 indirectBufferOffset: mtlIndBuffOfst
-															threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
-						mtlIndBuffOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
-						break;
-					case kMVKGraphicsStageTessControl:
-						mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
-						if (pipeline->needsTessCtlOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: tcOutBuff->_mtlBuffer
-												  offset: tcOutBuff->_offset
-												 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::Output]];
-						}
-						if (pipeline->needsTessCtlPatchOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: tcPatchOutBuff->_mtlBuffer
-												  offset: tcPatchOutBuff->_offset
-												 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::PatchOutput]];
-						}
-						[mtlTessCtlEncoder setBuffer: tcLevelBuff->_mtlBuffer
-											  offset: tcLevelBuff->_offset
-											 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::TessLevel]];
-						[mtlTessCtlEncoder setBuffer: tcParamsBuff->_mtlBuffer
-											  offset: mtlParmBuffOfst
-											 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::IndirectParams]];
-						mtlParmBuffOfst += paramsIncr;
-						if (pipeline->needsVertexOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: vtxOutBuff->_mtlBuffer
-												  offset: vtxOutBuff->_offset
-												 atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessCtlInputBufferBinding)];
-						}
-						[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
-															 indirectBufferOffset: mtlIndBuffOfst
-															threadsPerThreadgroup: MTLSizeMake(tcWorkgroupSize, 1, 1)];
-						mtlIndBuffOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
-						cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
-						break;
-					case kMVKGraphicsStageRasterization:
-						if (mtlFeats.indirectTessellationDrawing) {
-							if (pipeline->needsTessCtlOutputBuffer()) {
-								[cmdEncoder->_mtlRenderEncoder setVertexBuffer: tcOutBuff->_mtlBuffer
-																		offset: tcOutBuff->_offset
-																	   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding)];
-							}
-							if (pipeline->needsTessCtlPatchOutputBuffer()) {
-								[cmdEncoder->_mtlRenderEncoder setVertexBuffer: tcPatchOutBuff->_mtlBuffer
-																		offset: tcPatchOutBuff->_offset
-																	   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalPatchInputBufferBinding)];
-							}
-							[cmdEncoder->_mtlRenderEncoder setVertexBuffer: tcLevelBuff->_mtlBuffer
-																	offset: tcLevelBuff->_offset
-																   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalLevelBufferBinding)];
-							[cmdEncoder->_mtlRenderEncoder setTessellationFactorBuffer: tcLevelBuff->_mtlBuffer
-																				offset: tcLevelBuff->_offset
-																		instanceStride: 0];
-							[cmdEncoder->_mtlRenderEncoder drawPatches: outControlPointCount
-													  patchIndexBuffer: nil
-												patchIndexBufferOffset: 0
-														indirectBuffer: mtlIndBuff
-												  indirectBufferOffset: mtlIndBuffOfst];
-						}
-						mtlIndBuffOfst += sizeof(MTLDrawPatchIndirectArguments);
-						break;
+				if (mtlFeats.indirectTessellationDrawing) {
+					if (bufs.tcOut) {
+						[cmdEncoder->_mtlRenderEncoder setVertexBuffer: bufs.tcOut
+																offset: slotIdx * tcOutPerDraw
+															   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding)];
+					}
+					if (bufs.tcPatchOut) {
+						[cmdEncoder->_mtlRenderEncoder setVertexBuffer: bufs.tcPatchOut
+																offset: slotIdx * tcPatchOutPerDraw
+															   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalPatchInputBufferBinding)];
+					}
+					[cmdEncoder->_mtlRenderEncoder setVertexBuffer: bufs.tcLevel
+															offset: slotIdx * tcLevelPerDraw
+														   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalLevelBufferBinding)];
+					[cmdEncoder->_mtlRenderEncoder setTessellationFactorBuffer: bufs.tcLevel
+																		offset: slotIdx * tcLevelPerDraw
+																instanceStride: 0];
+					[cmdEncoder->_mtlRenderEncoder drawPatches: outControlPointCount
+											  patchIndexBuffer: nil
+										patchIndexBufferOffset: 0
+												indirectBuffer: mtlIndBuff
+										  indirectBufferOffset: drawIndOfst];
 				}
 			}
 		}
@@ -1665,32 +1683,10 @@ void MVKCmdDrawIndexedIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 		uint32_t outControlPointCount = pipeline->getOutputControlPointCount();
 		uint32_t vertexCount = kMVKMaxDrawIndirectCountVertexCount;
 		uint32_t patchCount = mvkCeilingDivide(vertexCount, inControlPointCount);
-		VkDeviceSize indirectSize = (2 * sizeof(MTLDispatchThreadgroupsIndirectArguments) + sizeof(MTLDrawPatchIndirectArguments) + sizeof(MTLStageInRegionIndirectArguments)) * _maxDrawCount;
 		VkDeviceSize paramsIncr = std::max((size_t)dvcLimits.minUniformBufferOffsetAlignment, sizeof(uint32_t) * 2);
-		VkDeviceSize paramsSize = paramsIncr * _maxDrawCount;
-		auto* tempIndirectBuff = cmdEncoder->getTempMTLBuffer(indirectSize, true);
-		id<MTLBuffer> mtlIndBuff = tempIndirectBuff->_mtlBuffer;
-		VkDeviceSize mtlTempIndBuffOfst = tempIndirectBuff->_offset;
-		auto* tcParamsBuff = cmdEncoder->getTempMTLBuffer(paramsSize, true);
-		VkDeviceSize mtlParmBuffOfst = tcParamsBuff->_offset;
-		const MVKMTLBufferAllocation* vtxOutBuff = nullptr;
-		const MVKMTLBufferAllocation* tcOutBuff = nullptr;
-		const MVKMTLBufferAllocation* tcPatchOutBuff = nullptr;
-		if (pipeline->needsVertexOutputBuffer()) {
-			vtxOutBuff = cmdEncoder->getTempMTLBuffer(vertexCount * 4 * dvcLimits.maxVertexOutputComponents, true);
-		}
-		if (pipeline->needsTessCtlOutputBuffer()) {
-			tcOutBuff = cmdEncoder->getTempMTLBuffer(outControlPointCount * patchCount * 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents, true);
-		}
-		if (pipeline->needsTessCtlPatchOutputBuffer()) {
-			tcPatchOutBuff = cmdEncoder->getTempMTLBuffer(patchCount * 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents, true);
-		}
-		auto* tcLevelBuff = cmdEncoder->getTempMTLBuffer(patchCount * sizeof(MTLQuadTessellationFactorsHalf), true);
-		VkDeviceSize vtxIndexSize = vertexCount * mvkMTLIndexTypeSizeInBytes((MTLIndexType)ibb.mtlIndexType);
-		auto* vtxIndexBuff = cmdEncoder->getTempMTLBuffer(vtxIndexSize, true);
 
-		id<MTLComputePipelineState> vtxState;
-		vtxState = ibb.mtlIndexType == MTLIndexTypeUInt16 ? pipeline->getTessVertexStageIndex16State() : pipeline->getTessVertexStageIndex32State();
+		id<MTLComputePipelineState> vtxState = ibb.mtlIndexType == MTLIndexTypeUInt16
+			? pipeline->getTessVertexStageIndex16State() : pipeline->getTessVertexStageIndex32State();
 		NSUInteger vtxThreadExecWidth = vtxState.threadExecutionWidth;
 
 		NSUInteger sgSize = pipeline->getTessControlStageState().threadExecutionWidth;
@@ -1700,134 +1696,161 @@ void MVKCmdDrawIndexedIndirectCount::encode(MVKCommandEncoder* cmdEncoder) {
 			tcWorkgroupSize = mvkLeastCommonMultiple(outControlPointCount, sgSize);
 		}
 
-		VkDeviceSize mtlIndBuffOfst = _mtlIndirectBufferOffset;
+		uint32_t vtxOutStride = pipeline->getVertexOutputStride();
+		if (vtxOutStride == 0) vtxOutStride = 4 * dvcLimits.maxVertexOutputComponents;
+		uint32_t tcPerVtxStride = pipeline->getTessCtlPerVertexOutputStride();
+		if (tcPerVtxStride == 0) tcPerVtxStride = 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents;
+		uint32_t tcPerPatchStride = pipeline->getTessCtlPerPatchOutputStride();
+		if (tcPerPatchStride == 0) tcPerPatchStride = 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents;
 
-		MVKPiplineStages stages;
-		pipeline->getStages(stages);
+		static constexpr VkDeviceSize kBufAlign = 256;
+		VkDeviceSize vtxOutPerDraw = pipeline->needsVertexOutputBuffer() ? mvkAlignByteCount(vertexCount * vtxOutStride, kBufAlign) : 0;
+		VkDeviceSize tcOutPerDraw = pipeline->needsTessCtlOutputBuffer() ? mvkAlignByteCount(outControlPointCount * patchCount * tcPerVtxStride, kBufAlign) : 0;
+		VkDeviceSize tcPatchOutPerDraw = pipeline->needsTessCtlPatchOutputBuffer() ? mvkAlignByteCount(patchCount * tcPerPatchStride, kBufAlign) : 0;
+		VkDeviceSize tcLevelPerDraw = mvkAlignByteCount(patchCount * sizeof(MTLQuadTessellationFactorsHalf), kBufAlign);
+		VkDeviceSize vtxIndexPerDraw = mvkAlignByteCount(vertexCount * mvkMTLIndexTypeSizeInBytes((MTLIndexType)ibb.mtlIndexType), kBufAlign);
+		VkDeviceSize perDrawOutputSize = vtxOutPerDraw + tcOutPerDraw + tcPatchOutPerDraw + tcLevelPerDraw + vtxIndexPerDraw;
 
-		{
-			static int diagOnce = 0;
-			if (diagOnce++ < 3) {
-				NSLog(@"[ICB-tess-dbg] indexed tess loop: maxDraw=%u stride=%u sizeof=%lu vtxBudget=%u paramsIncr=%llu minUBOAlign=%u",
-					  _maxDrawCount, _mtlIndirectBufferStride,
-					  (unsigned long)sizeof(MTLDrawIndexedPrimitivesIndirectArguments),
-					  vertexCount, (unsigned long long)paramsIncr, dvcLimits.minUniformBufferOffsetAlignment);
-			}
-		}
+		static constexpr VkDeviceSize kTessBatchMemBudget = 64 * 1024 * 1024;
+		uint32_t batchSize = perDrawOutputSize > 0
+			? std::max(1u, (uint32_t)(kTessBatchMemBudget / perDrawOutputSize))
+			: _maxDrawCount;
+		batchSize = std::min(batchSize, _maxDrawCount);
 
-		for (uint32_t drawIdx = 0; drawIdx < _maxDrawCount; drawIdx++) {
-			for (uint32_t s : stages) {
-				auto stage = MVKGraphicsStage(s);
-				id<MTLComputeCommandEncoder> mtlTessCtlEncoder = nil;
-				if (stage == kMVKGraphicsStageVertex) {
-					cmdEncoder->encodeStoreActions(true);
-					MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
-					mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
-					if (drawIdx == 0) {
-						id<MTLComputePipelineState> mtlConvertState = cmdEncoder->getCommandEncodingPool()->getCmdDrawIndirectCountTessConvertBuffersMTLComputePipelineState(true);
-						state.bindPipeline(mtlTessCtlEncoder, mtlConvertState);
-						state.bindBuffer(mtlTessCtlEncoder, _mtlIndirectBuffer,           _mtlIndirectBufferOffset,  0);
-						state.bindBuffer(mtlTessCtlEncoder, tempIndirectBuff->_mtlBuffer, tempIndirectBuff->_offset, 1);
-						state.bindBuffer(mtlTessCtlEncoder, tcParamsBuff->_mtlBuffer,     tcParamsBuff->_offset,     2);
-						state.bindStructBytes(mtlTessCtlEncoder, &_mtlIndirectBufferStride, 3);
-						state.bindStructBytes(mtlTessCtlEncoder, &inControlPointCount,      4);
-						state.bindStructBytes(mtlTessCtlEncoder, &outControlPointCount,     5);
-						state.bindStructBytes(mtlTessCtlEncoder, &_maxDrawCount,            6);
-						state.bindStructBytes(mtlTessCtlEncoder, &vtxThreadExecWidth,       7);
-						state.bindStructBytes(mtlTessCtlEncoder, &tcWorkgroupSize,          8);
-						state.bindBuffer(mtlTessCtlEncoder, _mtlCountBuffer,               _mtlCountBufferOffset,    9);
-						state.bindStructBytes(mtlTessCtlEncoder, &paramsIncr,               10);
-						[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(_maxDrawCount, mtlConvertState.threadExecutionWidth), 1, 1)
-										  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
-					}
-					state.bindPipeline(mtlTessCtlEncoder, cmdEncoder->getCommandEncodingPool()->getCmdDrawIndexedCopyIndexBufferMTLComputePipelineState((MTLIndexType)ibb.mtlIndexType));
-					state.bindBuffer(mtlTessCtlEncoder, ibb.mtlBuffer,            ibb.offset,            0);
-					state.bindBuffer(mtlTessCtlEncoder, vtxIndexBuff->_mtlBuffer, vtxIndexBuff->_offset, 1);
-					state.bindBuffer(mtlTessCtlEncoder, _mtlIndirectBuffer,       mtlIndBuffOfst,        2);
-					[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(vertexCount, vtxThreadExecWidth), 1, 1)
-									  threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
-					mtlIndBuffOfst += _mtlIndirectBufferStride;
+		VkDeviceSize indirectPerDraw = sizeof(MTLStageInRegionIndirectArguments) + 2 * sizeof(MTLDispatchThreadgroupsIndirectArguments) + sizeof(MTLDrawPatchIndirectArguments);
+
+		auto* tempIndirectBuff = cmdEncoder->getTempMTLBuffer(indirectPerDraw * _maxDrawCount, true);
+		id<MTLBuffer> mtlIndBuff = tempIndirectBuff->_mtlBuffer;
+		auto* tcParamsBuff = cmdEncoder->getTempMTLBuffer(paramsIncr * _maxDrawCount, true);
+
+		auto* encPool = cmdEncoder->getCommandEncodingPool();
+		auto bufs = encPool->getTessOutputBuffers(true,
+			vtxOutPerDraw * batchSize, tcOutPerDraw * batchSize,
+			tcPatchOutPerDraw * batchSize, tcLevelPerDraw * batchSize,
+			vtxIndexPerDraw * batchSize);
+
+		// Convert kernel: once for all draws.
+		cmdEncoder->encodeStoreActions(true);
+		id<MTLComputeCommandEncoder> mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+		MVKMetalComputeCommandEncoderState& compState = cmdEncoder->getMtlCompute();
+		id<MTLComputePipelineState> mtlConvertState = encPool->getCmdDrawIndirectCountTessConvertBuffersMTLComputePipelineState(true);
+		compState.bindPipeline(mtlTessCtlEncoder, mtlConvertState);
+		compState.bindBuffer(mtlTessCtlEncoder, _mtlIndirectBuffer,           _mtlIndirectBufferOffset,  0);
+		compState.bindBuffer(mtlTessCtlEncoder, tempIndirectBuff->_mtlBuffer, tempIndirectBuff->_offset, 1);
+		compState.bindBuffer(mtlTessCtlEncoder, tcParamsBuff->_mtlBuffer,     tcParamsBuff->_offset,     2);
+		compState.bindStructBytes(mtlTessCtlEncoder, &_mtlIndirectBufferStride, 3);
+		compState.bindStructBytes(mtlTessCtlEncoder, &inControlPointCount,      4);
+		compState.bindStructBytes(mtlTessCtlEncoder, &outControlPointCount,     5);
+		compState.bindStructBytes(mtlTessCtlEncoder, &_maxDrawCount,            6);
+		compState.bindStructBytes(mtlTessCtlEncoder, &vtxThreadExecWidth,       7);
+		compState.bindStructBytes(mtlTessCtlEncoder, &tcWorkgroupSize,          8);
+		compState.bindBuffer(mtlTessCtlEncoder, _mtlCountBuffer,               _mtlCountBufferOffset,    9);
+		compState.bindStructBytes(mtlTessCtlEncoder, &paramsIncr,               10);
+		[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(_maxDrawCount, mtlConvertState.threadExecutionWidth), 1, 1)
+						  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+
+		for (uint32_t batchStart = 0; batchStart < _maxDrawCount; batchStart += batchSize) {
+			uint32_t batchEnd = std::min(batchStart + batchSize, _maxDrawCount);
+
+			// Phase 1: all compute work in one encoder.
+			cmdEncoder->encodeStoreActions(true);
+			mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+
+			for (uint32_t drawIdx = batchStart; drawIdx < batchEnd; drawIdx++) {
+				uint32_t slotIdx = drawIdx - batchStart;
+				VkDeviceSize drawIndOfst = tempIndirectBuff->_offset + drawIdx * indirectPerDraw;
+				VkDeviceSize drawSrcOfst = _mtlIndirectBufferOffset + drawIdx * _mtlIndirectBufferStride;
+
+				// Index copy (direct Metal calls to avoid state tracker interference).
+				[mtlTessCtlEncoder setComputePipelineState: encPool->getCmdDrawIndexedCopyIndexBufferMTLComputePipelineState((MTLIndexType)ibb.mtlIndexType)];
+				[mtlTessCtlEncoder setBuffer: ibb.mtlBuffer      offset: ibb.offset               atIndex: 0];
+				[mtlTessCtlEncoder setBuffer: bufs.vtxIdx        offset: slotIdx * vtxIndexPerDraw atIndex: 1];
+				[mtlTessCtlEncoder setBuffer: _mtlIndirectBuffer offset: drawSrcOfst               atIndex: 2];
+				[mtlTessCtlEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(vertexCount, vtxThreadExecWidth), 1, 1)
+								  threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
+
+				cmdEncoder->finalizeDrawState(kMVKGraphicsStageVertex);
+				if (!pipeline->hasValidMTLPipelineStates()) { return; }
+				mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+				if (bufs.vtxOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.vtxOut
+										  offset: slotIdx * vtxOutPerDraw
+										 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Output]];
 				}
+				[mtlTessCtlEncoder setBuffer: bufs.vtxIdx
+									  offset: slotIdx * vtxIndexPerDraw
+									 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Index]];
+				[mtlTessCtlEncoder setStageInRegion: MTLRegionMake2D(0, 0, vertexCount, vertexCount)];
+				[mtlTessCtlEncoder setStageInRegionWithIndirectBuffer: mtlIndBuff
+					                             indirectBufferOffset: drawIndOfst];
+				drawIndOfst += sizeof(MTLStageInRegionIndirectArguments);
+				[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
+													 indirectBufferOffset: drawIndOfst
+													threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
+				drawIndOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
 
-				cmdEncoder->finalizeDrawState(stage);
+				cmdEncoder->finalizeDrawState(kMVKGraphicsStageTessControl);
+				if (!pipeline->hasValidMTLPipelineStates()) { return; }
+				mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
+				if (bufs.tcOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.tcOut
+										  offset: slotIdx * tcOutPerDraw
+										 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::Output]];
+				}
+				if (bufs.tcPatchOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.tcPatchOut
+										  offset: slotIdx * tcPatchOutPerDraw
+										 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::PatchOutput]];
+				}
+				[mtlTessCtlEncoder setBuffer: bufs.tcLevel
+									  offset: slotIdx * tcLevelPerDraw
+									 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::TessLevel]];
+				[mtlTessCtlEncoder setBuffer: tcParamsBuff->_mtlBuffer
+									  offset: tcParamsBuff->_offset + drawIdx * paramsIncr
+									 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::IndirectParams]];
+				if (bufs.vtxOut) {
+					[mtlTessCtlEncoder setBuffer: bufs.vtxOut
+										  offset: slotIdx * vtxOutPerDraw
+										 atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessCtlInputBufferBinding)];
+				}
+				[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
+													 indirectBufferOffset: drawIndOfst
+													threadsPerThreadgroup: MTLSizeMake(tcWorkgroupSize, 1, 1)];
+			}
+
+			// Phase 2: all rasterization in one render pass.
+			cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+
+			for (uint32_t drawIdx = batchStart; drawIdx < batchEnd; drawIdx++) {
+				uint32_t slotIdx = drawIdx - batchStart;
+				VkDeviceSize drawIndOfst = tempIndirectBuff->_offset + drawIdx * indirectPerDraw
+					+ sizeof(MTLStageInRegionIndirectArguments) + 2 * sizeof(MTLDispatchThreadgroupsIndirectArguments);
+
+				cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);
 				if (!pipeline->hasValidMTLPipelineStates()) { return; }
 
-				switch (stage) {
-					case kMVKGraphicsStageVertex:
-						mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
-						if (pipeline->needsVertexOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: vtxOutBuff->_mtlBuffer
-												 offset: vtxOutBuff->_offset
-												atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Output]];
-						}
-						[mtlTessCtlEncoder setBuffer: vtxIndexBuff->_mtlBuffer
-											  offset: vtxIndexBuff->_offset
-											 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Index]];
-						[mtlTessCtlEncoder setStageInRegion: MTLRegionMake2D(0, 0, vertexCount, vertexCount)];
-						[mtlTessCtlEncoder setStageInRegionWithIndirectBuffer: mtlIndBuff
-							                             indirectBufferOffset: mtlTempIndBuffOfst];
-						mtlTempIndBuffOfst += sizeof(MTLStageInRegionIndirectArguments);
-						[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
-															 indirectBufferOffset: mtlTempIndBuffOfst
-															threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
-						mtlTempIndBuffOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
-						break;
-					case kMVKGraphicsStageTessControl:
-						mtlTessCtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
-						if (pipeline->needsTessCtlOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: tcOutBuff->_mtlBuffer
-												  offset: tcOutBuff->_offset
-												 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::Output]];
-						}
-						if (pipeline->needsTessCtlPatchOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: tcPatchOutBuff->_mtlBuffer
-												  offset: tcPatchOutBuff->_offset
-												 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::PatchOutput]];
-						}
-						[mtlTessCtlEncoder setBuffer: tcLevelBuff->_mtlBuffer
-											  offset: tcLevelBuff->_offset
-											 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::TessLevel]];
-						[mtlTessCtlEncoder setBuffer: tcParamsBuff->_mtlBuffer
-											  offset: mtlParmBuffOfst
-											 atIndex: pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::IndirectParams]];
-						mtlParmBuffOfst += paramsIncr;
-						if (pipeline->needsVertexOutputBuffer()) {
-							[mtlTessCtlEncoder setBuffer: vtxOutBuff->_mtlBuffer
-												  offset: vtxOutBuff->_offset
-												 atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessCtlInputBufferBinding)];
-						}
-						[mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
-															 indirectBufferOffset: mtlTempIndBuffOfst
-															threadsPerThreadgroup: MTLSizeMake(tcWorkgroupSize, 1, 1)];
-						mtlTempIndBuffOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
-						cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
-						break;
-					case kMVKGraphicsStageRasterization:
-						if (mtlFeats.indirectTessellationDrawing) {
-							if (pipeline->needsTessCtlOutputBuffer()) {
-								[cmdEncoder->_mtlRenderEncoder setVertexBuffer: tcOutBuff->_mtlBuffer
-																		offset: tcOutBuff->_offset
-																	   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding)];
-							}
-							if (pipeline->needsTessCtlPatchOutputBuffer()) {
-								[cmdEncoder->_mtlRenderEncoder setVertexBuffer: tcPatchOutBuff->_mtlBuffer
-																		offset: tcPatchOutBuff->_offset
-																	   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalPatchInputBufferBinding)];
-							}
-							[cmdEncoder->_mtlRenderEncoder setVertexBuffer: tcLevelBuff->_mtlBuffer
-																	offset: tcLevelBuff->_offset
-																   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalLevelBufferBinding)];
-							[cmdEncoder->_mtlRenderEncoder setTessellationFactorBuffer: tcLevelBuff->_mtlBuffer
-																				offset: tcLevelBuff->_offset
-																		instanceStride: 0];
-							[cmdEncoder->_mtlRenderEncoder drawPatches: outControlPointCount
-													  patchIndexBuffer: nil
-												patchIndexBufferOffset: 0
-														indirectBuffer: mtlIndBuff
-												  indirectBufferOffset: mtlTempIndBuffOfst];
-						}
-						mtlTempIndBuffOfst += sizeof(MTLDrawPatchIndirectArguments);
-						break;
+				if (mtlFeats.indirectTessellationDrawing) {
+					if (bufs.tcOut) {
+						[cmdEncoder->_mtlRenderEncoder setVertexBuffer: bufs.tcOut
+																offset: slotIdx * tcOutPerDraw
+															   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding)];
+					}
+					if (bufs.tcPatchOut) {
+						[cmdEncoder->_mtlRenderEncoder setVertexBuffer: bufs.tcPatchOut
+																offset: slotIdx * tcPatchOutPerDraw
+															   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalPatchInputBufferBinding)];
+					}
+					[cmdEncoder->_mtlRenderEncoder setVertexBuffer: bufs.tcLevel
+															offset: slotIdx * tcLevelPerDraw
+														   atIndex: cmdEncoder->getDevice()->getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalLevelBufferBinding)];
+					[cmdEncoder->_mtlRenderEncoder setTessellationFactorBuffer: bufs.tcLevel
+																		offset: slotIdx * tcLevelPerDraw
+																instanceStride: 0];
+					[cmdEncoder->_mtlRenderEncoder drawPatches: outControlPointCount
+											  patchIndexBuffer: nil
+										patchIndexBufferOffset: 0
+												indirectBuffer: mtlIndBuff
+										  indirectBufferOffset: drawIndOfst];
 				}
 			}
 		}

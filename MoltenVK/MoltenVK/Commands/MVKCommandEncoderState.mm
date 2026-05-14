@@ -1596,14 +1596,14 @@ void MVKMetalComputeCommandEncoderState::prepareRenderDispatch(
 	if (_pipeline != mtlPipeline) {
 		_pipeline = mtlPipeline;
 		[encoder setComputePipelineState:mtlPipeline];
+		// Metal invalidates all buffer bindings on pipeline change.
+		// Reset tracked state so descriptors and implicit buffers get rebound.
+		invalidateDescriptorSetImplicitBuffers(*this);
+		_exists.descriptorSetData.reset();
+		_exists.buffers.reset();
 	}
 
 	if (_vkStage != stage) {
-		if (_vkStage == kMVKShaderStageCompute) {
-			// Switching between graphics and compute, need to invalidate implicit buffers too
-			invalidateDescriptorSetImplicitBuffers(*this);
-			_exists.descriptorSetData.reset();
-		}
 		_vkStage = stage;
 	}
 
