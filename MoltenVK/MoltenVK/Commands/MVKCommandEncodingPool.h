@@ -124,6 +124,9 @@ public:
 	/** Returns a MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
 	id<MTLComputePipelineState> getCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed);
 
+	/** Returns a MTLComputePipelineState for converting an indirect buffer for use in a tessellated indirect-count draw. */
+	id<MTLComputePipelineState> getCmdDrawIndirectCountTessConvertBuffersMTLComputePipelineState(bool indexed);
+
 	/** Returns a MTLComputePipelineState for copying an index buffer for use in an indirect tessellated draw. */
 	id<MTLComputePipelineState> getCmdDrawIndexedCopyIndexBufferMTLComputePipelineState(MTLIndexType type);
 
@@ -181,6 +184,7 @@ protected:
 	id<MTLComputePipelineState> _mtlResolveColorImageComputePipelineState[kColorImageCount] = {nil, nil, nil, nil, nil, nil};
 	id<MTLComputePipelineState> _mtlDrawIndirectConvertBuffersComputePipelineState[2] = {nil, nil};
 	id<MTLComputePipelineState> _mtlDrawIndirectTessConvertBuffersComputePipelineState[2] = {nil, nil};
+	id<MTLComputePipelineState> _mtlDrawIndirectCountTessConvertBuffersComputePipelineState[2] = {nil, nil};
 	id<MTLComputePipelineState> _mtlDrawIndexedCopyIndexBufferComputePipelineState[2] = {nil, nil};
 	id<MTLComputePipelineState> _mtlCopyQueryPoolResultsComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlAccumOcclusionQueryResultsComputePipelineState = nil;

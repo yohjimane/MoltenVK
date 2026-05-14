@@ -360,6 +360,10 @@ public:
 	id<MTLComputePipelineState> newCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed,
 																							MVKVulkanAPIDeviceObject* owner);
 
+	/** Returns a new MTLComputePipelineState for converting an indirect buffer for use in a tessellated indirect-count draw. */
+	id<MTLComputePipelineState> newCmdDrawIndirectCountTessConvertBuffersMTLComputePipelineState(bool indexed,
+																								 MVKVulkanAPIDeviceObject* owner);
+
 	/** Returns a new MTLComputePipelineState for copying an index buffer for use in a tessellated draw. */
 	id<MTLComputePipelineState> newCmdDrawIndexedCopyIndexBufferMTLComputePipelineState(MTLIndexType type,
 																						MVKVulkanAPIDeviceObject* owner);
